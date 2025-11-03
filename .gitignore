@@ -1,0 +1,4 @@
+# ignore all the files starting from 'superres'
+suprres*
+
+

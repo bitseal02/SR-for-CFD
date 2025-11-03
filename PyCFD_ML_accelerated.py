@@ -457,6 +457,14 @@ class CFDSolver:
         if print_residuals:
             print()
         
+        # Check for NaN or Inf in residuals (indicates solver failure)
+        if np.isnan(rms).any() or np.isinf(rms).any():
+            print(f"\n❌ ERROR: NaN or Inf detected in residuals!")
+            print(f"   U-residual: {rms[0]:.6e}, V-residual: {rms[1]:.6e}, P-residual: {rms[2]:.6e}")
+            print(f"   This indicates solver instability or bad initial conditions.")
+            print(f"   Check ML predictions and boundary conditions.")
+            raise ValueError("Solver failed: NaN/Inf in residuals")
+        
         # Check convergence criteria
         converged = True
         if rms[0] > self.settings.convergence_criteria['u']:
@@ -740,27 +748,46 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
     print(f"STEP 2: ML Super-Resolution ({lr_dim}x{lr_dim} -> {hr_dim}x{hr_dim})")
     print(f"{'='*70}")
     
-    # Load standardization statistics
-    print(f"Loading standardization stats from '{stats_file}'...")
+    # Load component-specific standardization statistics
+    print(f"Loading component-specific standardization stats from '{stats_file}'...")
     stats = {}
     try:
         with open(stats_file, "r") as f:
             for line in f:
+                # Skip comments and empty lines
+                if line.strip().startswith('#') or not line.strip():
+                    continue
                 parts = line.strip().split()
                 if len(parts) == 2:
                     key, value = parts
                     stats[key] = float(value)
         
-        mean_lr = stats[f'mean{lr_dim}']
-        std_lr = stats[f'std{lr_dim}']
-        mean_hr = stats[f'mean{hr_dim}']
-        std_hr = stats[f'std{hr_dim}']
-        print(f"  ✓ Stats loaded: LR(mean={mean_lr:.4f}, std={std_lr:.4f}), HR(mean={mean_hr:.4f}, std={std_hr:.4f})")
+        # Load component-specific statistics
+        stats_lr = {
+            'u': (stats[f'mean{lr_dim}_u'], stats[f'std{lr_dim}_u']),
+            'v': (stats[f'mean{lr_dim}_v'], stats[f'std{lr_dim}_v']),
+            'p': (stats[f'mean{lr_dim}_p'], stats[f'std{lr_dim}_p'])
+        }
+        stats_hr = {
+            'u': (stats[f'mean{hr_dim}_u'], stats[f'std{hr_dim}_u']),
+            'v': (stats[f'mean{hr_dim}_v'], stats[f'std{hr_dim}_v']),
+            'p': (stats[f'mean{hr_dim}_p'], stats[f'std{hr_dim}_p'])
+        }
+        
+        print(f"  ✓ Component-specific stats loaded:")
+        print(f"    LR - U: mean={stats_lr['u'][0]:.6f}, std={stats_lr['u'][1]:.6f}")
+        print(f"    LR - V: mean={stats_lr['v'][0]:.6f}, std={stats_lr['v'][1]:.6f}")
+        print(f"    LR - P: mean={stats_lr['p'][0]:.6f}, std={stats_lr['p'][1]:.6f}")
+        print(f"    HR - U: mean={stats_hr['u'][0]:.6f}, std={stats_hr['u'][1]:.6f}")
+        print(f"    HR - V: mean={stats_hr['v'][0]:.6f}, std={stats_hr['v'][1]:.6f}")
+        print(f"    HR - P: mean={stats_hr['p'][0]:.6f}, std={stats_hr['p'][1]:.6f}")
+            
     except FileNotFoundError:
         print(f"❌ FATAL: Stats file '{stats_file}' not found.")
         raise
     except KeyError as e:
-        print(f"❌ FATAL: Missing key in stats file: {e}")
+        print(f"❌ FATAL: Missing component-specific stats in file. Required keys: mean{lr_dim}_u/v/p, std{lr_dim}_u/v/p, mean{hr_dim}_u/v/p, std{hr_dim}_u/v/p")
+        print(f"   Missing key: {e}")
         raise
     
     # Load ML models
@@ -775,7 +802,7 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         print(f"❌ FATAL: Error loading models: {e}")
         raise
     
-    # Super-resolve each field component
+    # Super-resolve each field component using component-specific stats
     hr_fields = {}
     for component in ['u', 'v', 'p']:
         print(f"  - Super-resolving '{component.upper()}' field...")
@@ -783,8 +810,12 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         # Get coarse field data
         x_lr_raw = coarse_fields[component].astype(np.float32)  # Shape: (lr_dim, lr_dim)
         
-        # Standardize
-        x_lr_norm = standardize_with_stats(x_lr_raw, mean_lr, std_lr)
+        # Get component-specific statistics
+        mean_lr_comp, std_lr_comp = stats_lr[component]
+        mean_hr_comp, std_hr_comp = stats_hr[component]
+        
+        # Standardize using component-specific stats
+        x_lr_norm = standardize_with_stats(x_lr_raw, mean_lr_comp, std_lr_comp)
         
         # Add batch and channel dimensions
         x_lr_norm_batch = np.expand_dims(x_lr_norm, axis=(0, -1))  # Shape: (1, lr_dim, lr_dim, 1)
@@ -792,11 +823,23 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         # Predict
         pred_hr_norm = inference_model.predict(x_lr_norm_batch, verbose=0)[0, ..., 0]  # Shape: (hr_dim, hr_dim)
         
-        # Inverse standardize
-        pred_hr_real = inverse_standardize(pred_hr_norm, mean_hr, std_hr)
+        # Inverse standardize using component-specific stats
+        pred_hr_real = inverse_standardize(pred_hr_norm, mean_hr_comp, std_hr_comp)
         
         hr_fields[component] = pred_hr_real
         print(f"    Shape: {x_lr_raw.shape} -> {pred_hr_real.shape}")
+        print(f"    Input range: [{x_lr_raw.min():.6f}, {x_lr_raw.max():.6f}]")
+        print(f"    Output range: [{pred_hr_real.min():.6f}, {pred_hr_real.max():.6f}]")
+        
+        # Check for NaN or Inf values
+        if np.isnan(pred_hr_real).any() or np.isinf(pred_hr_real).any():
+            nan_count = np.isnan(pred_hr_real).sum()
+            inf_count = np.isinf(pred_hr_real).sum()
+            print(f"    ⚠️  WARNING: Component '{component.upper()}' contains {nan_count} NaN and {inf_count} Inf values!")
+            print(f"    ⚠️  ML model may not generalize well to these boundary conditions")
+            print(f"    ⚠️  Replacing NaN/Inf with zeros to prevent solver failure...")
+            pred_hr_real = np.nan_to_num(pred_hr_real, nan=0.0, posinf=0.0, neginf=0.0)
+            hr_fields[component] = pred_hr_real
     
     print(f"  ✓ Super-resolution complete")
     return hr_fields
@@ -1289,7 +1332,7 @@ if __name__ == "__main__":
     max_iterations_coarse = 100000       # Max iterations for coarse mesh simulation (10x10)
     max_iterations_fine_ml = 200     # Max iterations for fine mesh with ML initialization
     max_iterations_normal = 100000         # Max iterations for normal simulation
-    
+    other_details="swish_trained_upto_700"  # Suffix for model files
     # =========================================================================
     # OPTIONAL: Define custom boundary conditions
     # If not provided, default lid-driven cavity BCs will be used
@@ -1304,7 +1347,7 @@ if __name__ == "__main__":
         'left': BoundaryCondition('dirichlet', 0.0),
         'right': BoundaryCondition('dirichlet', 0.0),
         'top': BoundaryCondition('dirichlet', 1.0),    # Moving lid with velocity 1.0
-        'bottom': BoundaryCondition('dirichlet', 0.0)
+        'bottom': BoundaryCondition('dirichlet', 1.0)
     }
     bc.v_boundaries = {
         'left': BoundaryCondition('dirichlet', 0.0),
@@ -1319,19 +1362,7 @@ if __name__ == "__main__":
         'bottom': BoundaryCondition('neumann', 0.0)
     }
     
-    # Example 3: Custom boundary conditions for different problems
-    # Uncomment and modify as needed for your specific case
-    # bc = BoundaryConditions()
-    # bc.u_boundaries = {
-    #     'left': BoundaryCondition('dirichlet', 0.5),   # Custom inlet velocity
-    #     'right': BoundaryCondition('neumann', 0.0),    # Outlet
-    #     'top': BoundaryCondition('dirichlet', 0.0),    # No-slip wall
-    #     'bottom': BoundaryCondition('dirichlet', 0.0)  # No-slip wall
-    # }
-    # ... (define v and p boundaries similarly)
-    
-    # =========================================================================
-    
+ 
     # PART 1: Generate coarse mesh solution
     print("\n" + "#"*70)
     print("# PART 1A: GENERATE COARSE MESH SOLUTION")
@@ -1362,9 +1393,9 @@ if __name__ == "__main__":
         convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
         max_iterations_fine=max_iterations_fine_ml,
         output_name=f"cavity_Re{Re}_{nx}x{ny}_{max_iterations_coarse}_coarse_{max_iterations_fine_ml}_fine_ML",
-        stats_file=f"standardization_stats_{lr_dim}to{nx}_swish_trained_upto_700.txt",
-        encoder_file=f"vanilla_encoder{lr_dim}_to_{nx}_swish_trained_upto_700.h5",
-        decoder_file=f"vanilla_decoder{nx}_from_{lr_dim}_swish_trained_upto_700.h5",
+        stats_file=f"standardization_stats_{lr_dim}to{nx}_{other_details}.txt",
+        encoder_file=f"vanilla_encoder{lr_dim}_to_{nx}_{other_details}.h5",
+        decoder_file=f"vanilla_decoder{nx}_from_{lr_dim}_{other_details}.h5",
         bc=bc  # Pass boundary conditions
     )
     
