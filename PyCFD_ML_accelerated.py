@@ -8,9 +8,30 @@ import os
 import sys
 from typing import Dict, Optional, Tuple
 from numba import njit, prange
+from datetime import datetime
 import time
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
+
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+def create_timestamped_output_dir(base_dir: str = "outputs") -> str:
+    """
+    Create a timestamped output directory in format: outputs/dd-mm-yyyy-h-m-s
+    
+    Args:
+        base_dir: Base directory name (default: "outputs")
+    
+    Returns:
+        Path to the created timestamped directory
+    """
+    timestamp = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
+    output_dir = os.path.join(base_dir, timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
 
 
 # ==============================================================================
@@ -676,12 +697,19 @@ def run_coarse_simulation(Re: float, lr_dim: int = 10,
                          dt: float = 0.001, scheme: str = 'QUICK',
                          convergence_criteria: Dict[str, float] = None,
                          max_iterations: int = 100000,
-                         temp_output_dir: str = "temp_coarse_sim",
+                         output_dir: str = None,
                          bc: Optional[BoundaryConditions] = None) -> Dict[str, np.ndarray]:
     """
     Step 1: Run a coarse (10x10) CFD simulation
     
     Args:
+        Re: Reynolds number
+        lr_dim: Low resolution dimension (default: 10)
+        dt: Time step
+        scheme: Numerical scheme
+        convergence_criteria: Convergence criteria dict
+        max_iterations: Maximum iterations
+        output_dir: Directory to save outputs. If None, creates timestamped directory.
         bc: BoundaryConditions object. If None, uses default lid-driven cavity BCs.
     
     Returns:
@@ -709,11 +737,17 @@ def run_coarse_simulation(Re: float, lr_dim: int = 10,
     # Create solver and run
     solver = CFDSolver(mesh, fluid, solver_settings, bc)
     
-    # Create temp directory for coarse simulation output
-    os.makedirs(temp_output_dir, exist_ok=True)
-    temp_output_name = os.path.join(temp_output_dir, f"coarse_Re{Re}_{lr_dim}x{lr_dim}_{max_iterations}_coarse_iterations")
+    # Create output directory if not provided
+    if output_dir is None:
+        output_dir = create_timestamped_output_dir()
     
-    iterations, time_elapsed = solver.solve(temp_output_name, verbose=True)
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    output_name = os.path.join(output_dir, f"coarse_Re{Re}_{lr_dim}x{lr_dim}_{max_iterations}_coarse_iterations")
+    
+    print(f"Saving coarse simulation output to: {output_dir}")
+    
+    iterations, time_elapsed = solver.solve(output_name, verbose=True)
     
     print(f"Coarse simulation completed in {iterations} iterations ({time_elapsed:.2f} seconds)")
     
@@ -936,9 +970,9 @@ def generate_coarse_mesh_solution(
     scheme: str = 'QUICK',
     convergence_criteria: Dict[str, float] = None,
     max_iterations_coarse: int = 100000,
-    temp_output_dir: str = "temp_coarse_sim",
+    output_dir: str = None,
     bc: Optional[BoundaryConditions] = None
-) -> Dict[str, np.ndarray]:
+) -> tuple:
     """
     Generate coarse mesh solution
     
@@ -949,17 +983,24 @@ def generate_coarse_mesh_solution(
         scheme: Numerical scheme ('QUICK' or 'UPWIND')
         convergence_criteria: Convergence criteria dict
         max_iterations_coarse: Maximum iterations for coarse mesh simulation
-        temp_output_dir: Directory for temporary coarse simulation outputs
+        output_dir: Directory for outputs. If None, creates timestamped directory in outputs/
         bc: BoundaryConditions object. If None, uses default lid-driven cavity BCs.
     
     Returns:
-        Dictionary with 'u', 'v', 'p' fields of shape (lr_dim, lr_dim)
+        Tuple of (coarse_fields, output_dir) where:
+            - coarse_fields: Dictionary with 'u', 'v', 'p' fields of shape (lr_dim, lr_dim)
+            - output_dir: The directory where outputs were saved
     """
     
     print(f"\n{'#'*70}")
     print(f"# GENERATING COARSE MESH SOLUTION")
     print(f"# Re={Re}, Coarse Resolution={lr_dim}x{lr_dim}")
     print(f"{'#'*70}\n")
+    
+    # Create timestamped output directory if not provided
+    if output_dir is None:
+        output_dir = create_timestamped_output_dir()
+        print(f"Created timestamped output directory: {output_dir}")
     
     # Run coarse simulation
     coarse_fields = run_coarse_simulation(
@@ -969,7 +1010,7 @@ def generate_coarse_mesh_solution(
         scheme=scheme,
         convergence_criteria=convergence_criteria,
         max_iterations=max_iterations_coarse,
-        temp_output_dir=temp_output_dir,
+        output_dir=output_dir,
         bc=bc
     )
     
@@ -977,7 +1018,7 @@ def generate_coarse_mesh_solution(
     print(f"# COARSE MESH SOLUTION COMPLETE")
     print(f"{'#'*70}\n")
     
-    return coarse_fields
+    return coarse_fields, output_dir
 
 
 def run_ml_accelerated_fine_simulation(
@@ -1367,14 +1408,19 @@ if __name__ == "__main__":
     print("\n" + "#"*70)
     print("# PART 1A: GENERATE COARSE MESH SOLUTION")
     print("#"*70)
-    coarse_fields = generate_coarse_mesh_solution(
+    
+    # Create a single timestamped output directory for this run
+    output_dir = create_timestamped_output_dir()
+    print(f"All outputs will be saved to: {output_dir}")
+    
+    coarse_fields, output_dir = generate_coarse_mesh_solution(
         Re=Re,
         lr_dim=lr_dim,
         dt=0.001,
         scheme='QUICK',
         convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
         max_iterations_coarse=max_iterations_coarse,
-        temp_output_dir="temp_coarse_sim",
+        output_dir=output_dir,  # Use the timestamped directory
         bc=bc  # Pass boundary conditions
     )
     
@@ -1392,7 +1438,7 @@ if __name__ == "__main__":
         scheme='QUICK',
         convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
         max_iterations_fine=max_iterations_fine_ml,
-        output_name=f"cavity_Re{Re}_{nx}x{ny}_{max_iterations_coarse}_coarse_{max_iterations_fine_ml}_fine_ML",
+        output_name=os.path.join(output_dir, f"cavity_Re{Re}_{nx}x{ny}_{max_iterations_coarse}_coarse_{max_iterations_fine_ml}_fine_ML"),  # Use same directory
         stats_file=f"standardization_stats_{lr_dim}to{nx}_{other_details}.txt",
         encoder_file=f"vanilla_encoder{lr_dim}_to_{nx}_{other_details}.h5",
         decoder_file=f"vanilla_decoder{nx}_from_{lr_dim}_{other_details}.h5",
@@ -1411,7 +1457,7 @@ if __name__ == "__main__":
         scheme='QUICK',
         convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
         max_iterations=max_iterations_normal,
-        output_name=f"cavity_Re{Re}_{nx}x{ny}_{max_iterations_normal}_NORMAL",
+        output_name=os.path.join(output_dir, f"cavity_Re{Re}_{nx}x{ny}_{max_iterations_normal}_NORMAL"),  # Use same directory
         bc=bc  # Pass boundary conditions
     )
     
@@ -1432,7 +1478,7 @@ if __name__ == "__main__":
         ml_centerlines, 
         normal_centerlines, 
         Re=Re,
-        save_path=f"centerline_comparison_Re{Re}_{nx}x{ny}_coarse{max_iterations_coarse}_ML{max_iterations_fine_ml}_NORMAL{max_iterations_normal}.png",
+        save_path=os.path.join(output_dir, f"centerline_comparison_Re{Re}_{nx}x{ny}_coarse{max_iterations_coarse}_ML{max_iterations_fine_ml}_NORMAL{max_iterations_normal}.png"),
         bc=bc
     )
     
