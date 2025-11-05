@@ -1,0 +1,29 @@
+# Core scientific computing
+numpy
+scipy
+
+# Deep learning framework
+tensorflow
+keras
+
+# Data handling and storage
+h5py
+
+# Numerical acceleration
+numba
+
+# Plotting and visualization
+matplotlib
+
+# For Jupyter notebook support in VS Code
+# These Python packages are REQUIRED even if you have VS Code Jupyter extension installed
+# The VS Code extension uses these packages to run notebooks
+jupyter
+ipykernel
+notebook
+
+# Optional: GPU acceleration (uncomment if you have CUDA-enabled GPU)
+# tensorflow-gpu
+
+# Note: The following are Python built-in modules (no installation needed):
+# os, sys, time, datetime, typing, dataclasses
