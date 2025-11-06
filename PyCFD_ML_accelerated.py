@@ -1373,7 +1373,7 @@ if __name__ == "__main__":
     max_iterations_coarse = 100000       # Max iterations for coarse mesh simulation (10x10)
     max_iterations_fine_ml = 200     # Max iterations for fine mesh with ML initialization
     max_iterations_normal = 100000         # Max iterations for normal simulation
-    other_details="swish_trained_upto_700"  # Suffix for model files
+    other_details="swish_trained_upto_700_multiBC"  # Suffix for model files
     # =========================================================================
     # OPTIONAL: Define custom boundary conditions
     # If not provided, default lid-driven cavity BCs will be used
