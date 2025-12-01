@@ -980,7 +980,9 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
                         lr_dim: int, hr_dim: int,
                         stats_file: str, encoder_file: str, decoder_file: str,
                         use_aspect_ratio_correction: bool = False,
-                        lx: float = 1.0, ly: float = 1.0) -> Dict[str, np.ndarray]:
+                        lx: float = 1.0, ly: float = 1.0,
+                        use_adaptive_normalization: bool = True,
+                        blend_factor: float = 0.3) -> Dict[str, np.ndarray]:
     """
     Step 2: Use ML models to super-resolve coarse simulation to fine resolution
     
@@ -993,6 +995,9 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         decoder_file: Path to decoder model file
         use_aspect_ratio_correction: If True, correct for aspect ratio mismatch
         lx, ly: Physical domain dimensions (for aspect ratio correction)
+        use_adaptive_normalization: If True, blend training stats with input data stats
+        blend_factor: Blending weight for adaptive normalization (0.0-1.0, default 0.3)
+                     Higher = more adaptation to input data, lower = more trust in training stats
     
     Returns:
         Dictionary with 'u', 'v', 'p' fields of shape (hr_dim, hr_dim)
@@ -1004,6 +1009,7 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         print(f"  Physical domain: {lx}×{ly} (aspect ratio: {lx/ly:.2f}:1)")
     else:
         print(f"  ⚙️  Aspect Ratio Correction: DISABLED")
+    print(f"  ⚙️  Adaptive Normalization: {'ENABLED' if use_adaptive_normalization else 'DISABLED'}")
     print(f"{'='*70}")
     
     # STEP 2.1: Aspect ratio correction (if enabled)
@@ -1080,6 +1086,18 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         # Get component-specific statistics
         mean_lr_comp, std_lr_comp = stats_lr[component]
         mean_hr_comp, std_hr_comp = stats_hr[component]
+        
+        # ADAPTIVE NORMALIZATION: Blend training stats with actual input stats
+        if use_adaptive_normalization:
+            input_mean = np.mean(x_lr_raw)
+            input_std = np.std(x_lr_raw)
+            
+            # Blend with specified weight on input data to help model adapt
+            mean_lr_comp = (1 - blend_factor) * mean_lr_comp + blend_factor * input_mean
+            std_lr_comp = (1 - blend_factor) * std_lr_comp + blend_factor * max(input_std, 1e-8)
+            
+            print(f"    Adaptive norm (blend={blend_factor:.2f}): Input mean={input_mean:.6f}, std={input_std:.6f}")
+            print(f"    Blended: mean={mean_lr_comp:.6f}, std={std_lr_comp:.6f}")
         
         # Standardize using component-specific stats
         x_lr_norm = standardize_with_stats(x_lr_raw, mean_lr_comp, std_lr_comp)
@@ -1384,7 +1402,9 @@ def run_ml_accelerated_fine_simulation(
     lx: float = 10.0,
     ly: float = 3.0,
     relaxation_factors: Dict[str, float] = None,
-    use_aspect_ratio_correction: bool = False
+    use_aspect_ratio_correction: bool = False,
+    use_adaptive_normalization: bool = True,
+    blend_factor: float = 0.3
 ) -> tuple:
     """
     Run ML-accelerated fine BFS simulation using coarse mesh solution
@@ -1411,6 +1431,8 @@ def run_ml_accelerated_fine_simulation(
         relaxation_factors: Under-relaxation factors
         use_aspect_ratio_correction: If True, correct for aspect ratio mismatch between
                                      training (square) and testing (rectangular) geometries
+        use_adaptive_normalization: If True, blend training stats with input data stats
+        blend_factor: Blending weight for adaptive normalization (0.0-1.0, default 0.3)
     
     Returns:
         (solver, iterations, time_elapsed)
@@ -1457,7 +1479,9 @@ def run_ml_accelerated_fine_simulation(
         decoder_file=decoder_file,
         use_aspect_ratio_correction=use_aspect_ratio_correction,
         lx=lx,
-        ly=ly
+        ly=ly,
+        use_adaptive_normalization=use_adaptive_normalization,
+        blend_factor=blend_factor
     )
     
     # STEP 2: Run fine simulation with ML initialization
@@ -1727,9 +1751,23 @@ if __name__ == "__main__":
     # True:  Resample rectangular→square before ML, then square→rectangular after ML
     # False: Use raw data directly (faster, but may reduce accuracy if aspect ratios differ)
     use_aspect_ratio_correction = True
+    
+    # =========================================================================
+    # ADDITIONAL ML IMPROVEMENTS
+    # =========================================================================
+    
+    # Adaptive normalization: Blend training stats with input data statistics
+    # Helps model adapt when BFS flow patterns differ significantly from lid-driven cavity
+    # blend_factor controls the blending weight:
+    #   0.0 = Use only training stats (no adaptation)
+    #   0.3 = 30% input data, 70% training stats (default, balanced)
+    #   0.5 = 50/50 blend (more aggressive adaptation)
+    #   1.0 = Use only input data stats (full adaptation, may be unstable)
+    blend_factor = 0.3
+    
     # =========================================================================
 
-    
+
     print(f"\n{'='*70}")
     print(f"CONFIGURATION SUMMARY")
     print(f"{'='*70}")
@@ -1738,6 +1776,7 @@ if __name__ == "__main__":
     print(f"Coarse Mesh: {lr_dim}×{lr_dim}")
     print(f"BFS Geometry: Lx={lx}, Ly={ly} (aspect ratio: {lx/ly:.2f}:1)")
     print(f"Aspect Ratio Correction: {'ENABLED ✓' if use_aspect_ratio_correction else 'DISABLED'}")
+    print(f"Adaptive Normalization Blend Factor: {blend_factor:.2f} ({blend_factor*100:.0f}% input data, {(1-blend_factor)*100:.0f}% training data)")
     if not use_aspect_ratio_correction and lx != ly:
         print(f"  ⚠️  Note: Testing rectangular geometry with model trained on square")
         print(f"     If results are poor, try enabling aspect ratio correction")
@@ -1830,7 +1869,9 @@ if __name__ == "__main__":
         lx=lx,
         ly=ly,
         relaxation_factors=relaxation_factors,
-        use_aspect_ratio_correction=use_aspect_ratio_correction
+        use_aspect_ratio_correction=use_aspect_ratio_correction,
+        use_adaptive_normalization=True,  # Enable adaptive normalization
+        blend_factor=blend_factor
     )
     
     # =========================================================================
