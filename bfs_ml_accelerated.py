@@ -22,6 +22,7 @@ from datetime import datetime
 import time
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
+from scipy import interpolate
 
 
 # ==============================================================================
@@ -53,6 +54,95 @@ def standardize_with_stats(arr, mean, std):
 def inverse_standardize(arr, mean, std):
     """Inverse standardization"""
     return arr * std + mean
+
+
+def reshape_rectangular_to_square(fields: Dict[str, np.ndarray], 
+                                  nx_rect: int, ny_rect: int,
+                                  lx: float, ly: float) -> Dict[str, np.ndarray]:
+    """
+    Resample rectangular grid data to square grid for ML model input.
+    
+    This is needed when testing a model trained on square geometry (e.g., lid-driven cavity)
+    on rectangular geometry (e.g., BFS). The model expects square aspect ratio data.
+    
+    Args:
+        fields: Dictionary with 'u', 'v', 'p' fields of shape (ny_rect, nx_rect)
+        nx_rect, ny_rect: Rectangular grid dimensions
+        lx, ly: Physical domain dimensions
+        
+    Returns:
+        Dictionary with resampled fields in square coordinate system
+    """
+    print(f"  Resampling rectangular ({nx_rect}×{ny_rect}) → square ({nx_rect}×{nx_rect})...")
+    print(f"  Physical domain: {lx}×{ly} (aspect ratio: {lx/ly:.2f}:1)")
+    
+    # Create coordinate systems
+    x_rect = np.linspace(0, lx, nx_rect)
+    y_rect = np.linspace(0, ly, ny_rect)
+    
+    # Square coordinate system (use max dimension)
+    L_square = max(lx, ly)
+    x_square = np.linspace(0, L_square, nx_rect)
+    y_square = np.linspace(0, L_square, nx_rect)
+    
+    fields_square = {}
+    for component in ['u', 'v', 'p']:
+        field_rect = fields[component]  # Shape: (ny_rect, nx_rect)
+        
+        # Create interpolator
+        interpolator = interpolate.RectBivariateSpline(y_rect, x_rect, field_rect, kx=3, ky=3)
+        
+        # Resample to square grid
+        field_square = interpolator(y_square, x_square)
+        
+        fields_square[component] = field_square
+        print(f"    {component.upper()}: {field_rect.shape} → {field_square.shape}")
+    
+    return fields_square
+
+
+def reshape_square_to_rectangular(fields: Dict[str, np.ndarray],
+                                  nx_rect: int, ny_rect: int,
+                                  lx: float, ly: float) -> Dict[str, np.ndarray]:
+    """
+    Resample square grid data back to rectangular grid after ML prediction.
+    
+    Args:
+        fields: Dictionary with 'u', 'v', 'p' fields of shape (nx_square, nx_square)
+        nx_rect, ny_rect: Target rectangular grid dimensions
+        lx, ly: Physical domain dimensions
+        
+    Returns:
+        Dictionary with fields resampled to rectangular coordinate system
+    """
+    # Assume input is square
+    nx_square = fields['u'].shape[0]
+    
+    print(f"  Resampling square ({nx_square}×{nx_square}) → rectangular ({nx_rect}×{ny_rect})...")
+    print(f"  Physical domain: {lx}×{ly} (aspect ratio: {lx/ly:.2f}:1)")
+    
+    # Create coordinate systems
+    L_square = max(lx, ly)
+    x_square = np.linspace(0, L_square, nx_square)
+    y_square = np.linspace(0, L_square, nx_square)
+    
+    x_rect = np.linspace(0, lx, nx_rect)
+    y_rect = np.linspace(0, ly, ny_rect)
+    
+    fields_rect = {}
+    for component in ['u', 'v', 'p']:
+        field_square = fields[component]  # Shape: (nx_square, nx_square)
+        
+        # Create interpolator
+        interpolator = interpolate.RectBivariateSpline(y_square, x_square, field_square, kx=3, ky=3)
+        
+        # Resample to rectangular grid
+        field_rect = interpolator(y_rect, x_rect)
+        
+        fields_rect[component] = field_rect
+        print(f"    {component.upper()}: {field_square.shape} → {field_rect.shape}")
+    
+    return fields_rect
 
 
 # ==============================================================================
@@ -888,7 +978,9 @@ def run_coarse_simulation(Re: float, lr_dim: int = 10,
 
 def ml_super_resolution(coarse_fields: Dict[str, np.ndarray], 
                         lr_dim: int, hr_dim: int,
-                        stats_file: str, encoder_file: str, decoder_file: str) -> Dict[str, np.ndarray]:
+                        stats_file: str, encoder_file: str, decoder_file: str,
+                        use_aspect_ratio_correction: bool = False,
+                        lx: float = 1.0, ly: float = 1.0) -> Dict[str, np.ndarray]:
     """
     Step 2: Use ML models to super-resolve coarse simulation to fine resolution
     
@@ -899,16 +991,31 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         stats_file: Path to standardization statistics file
         encoder_file: Path to encoder model file
         decoder_file: Path to decoder model file
+        use_aspect_ratio_correction: If True, correct for aspect ratio mismatch
+        lx, ly: Physical domain dimensions (for aspect ratio correction)
     
     Returns:
         Dictionary with 'u', 'v', 'p' fields of shape (hr_dim, hr_dim)
     """
     print(f"\n{'='*70}")
     print(f"STEP 2: ML Super-Resolution ({lr_dim}x{lr_dim} -> {hr_dim}x{hr_dim})")
+    if use_aspect_ratio_correction:
+        print(f"  ⚙️  Aspect Ratio Correction: ENABLED")
+        print(f"  Physical domain: {lx}×{ly} (aspect ratio: {lx/ly:.2f}:1)")
+    else:
+        print(f"  ⚙️  Aspect Ratio Correction: DISABLED")
     print(f"{'='*70}")
     
+    # STEP 2.1: Aspect ratio correction (if enabled)
+    coarse_fields_for_ml = coarse_fields
+    if use_aspect_ratio_correction and (lx != ly):
+        print(f"\n[Aspect Ratio Correction - Pre-ML]")
+        coarse_fields_for_ml = reshape_rectangular_to_square(
+            coarse_fields, lr_dim, lr_dim, lx, ly
+        )
+    
     # Load component-specific standardization statistics
-    print(f"Loading component-specific standardization stats from '{stats_file}'...")
+    print(f"\nLoading component-specific standardization stats from '{stats_file}'...")
     stats = {}
     try:
         with open(stats_file, "r") as f:
@@ -950,7 +1057,7 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
         raise
     
     # Load ML models
-    print(f"Loading encoder from '{encoder_file}'...")
+    print(f"\nLoading encoder from '{encoder_file}'...")
     print(f"Loading decoder from '{decoder_file}'...")
     try:
         encoder_lr = tf.keras.models.load_model(encoder_file, compile=False)
@@ -963,11 +1070,12 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
     
     # Super-resolve each field component using component-specific stats
     hr_fields = {}
+    print(f"\nSuper-resolving flow fields...")
     for component in ['u', 'v', 'p']:
         print(f"  - Super-resolving '{component.upper()}' field...")
         
-        # Get coarse field data
-        x_lr_raw = coarse_fields[component].astype(np.float32)  # Shape: (lr_dim, lr_dim)
+        # Get coarse field data (potentially aspect-ratio corrected)
+        x_lr_raw = coarse_fields_for_ml[component].astype(np.float32)  # Shape: (lr_dim, lr_dim)
         
         # Get component-specific statistics
         mean_lr_comp, std_lr_comp = stats_lr[component]
@@ -1000,7 +1108,14 @@ def ml_super_resolution(coarse_fields: Dict[str, np.ndarray],
             pred_hr_real = np.nan_to_num(pred_hr_real, nan=0.0, posinf=0.0, neginf=0.0)
             hr_fields[component] = pred_hr_real
     
-    print(f"  ✓ Super-resolution complete")
+    # STEP 2.2: Reverse aspect ratio correction (if enabled)
+    if use_aspect_ratio_correction and (lx != ly):
+        print(f"\n[Aspect Ratio Correction - Post-ML]")
+        hr_fields = reshape_square_to_rectangular(
+            hr_fields, hr_dim, hr_dim, lx, ly
+        )
+    
+    print(f"\n  ✓ Super-resolution complete")
     return hr_fields
 
 
@@ -1268,7 +1383,8 @@ def run_ml_accelerated_fine_simulation(
     Ub: float = 1.0,
     lx: float = 10.0,
     ly: float = 3.0,
-    relaxation_factors: Dict[str, float] = None
+    relaxation_factors: Dict[str, float] = None,
+    use_aspect_ratio_correction: bool = False
 ) -> tuple:
     """
     Run ML-accelerated fine BFS simulation using coarse mesh solution
@@ -1293,6 +1409,8 @@ def run_ml_accelerated_fine_simulation(
         lx: Domain length in x
         ly: Domain length in y
         relaxation_factors: Under-relaxation factors
+        use_aspect_ratio_correction: If True, correct for aspect ratio mismatch between
+                                     training (square) and testing (rectangular) geometries
     
     Returns:
         (solver, iterations, time_elapsed)
@@ -1302,6 +1420,10 @@ def run_ml_accelerated_fine_simulation(
     print(f"# ML-ACCELERATED FINE BFS SIMULATION")
     print(f"# Re={Re}, Target Resolution={nx}x{ny}")
     print(f"# Using coarse solution from {lr_dim}x{lr_dim}")
+    if use_aspect_ratio_correction:
+        print(f"# Aspect Ratio Correction: ENABLED")
+    else:
+        print(f"# Aspect Ratio Correction: DISABLED")
     print(f"{'#'*70}\n")
     
     # Set default file paths if not provided
@@ -1332,7 +1454,10 @@ def run_ml_accelerated_fine_simulation(
         hr_dim=nx,  # Assuming nx == ny
         stats_file=stats_file,
         encoder_file=encoder_file,
-        decoder_file=decoder_file
+        decoder_file=decoder_file,
+        use_aspect_ratio_correction=use_aspect_ratio_correction,
+        lx=lx,
+        ly=ly
     )
     
     # STEP 2: Run fine simulation with ML initialization
@@ -1593,6 +1718,32 @@ if __name__ == "__main__":
     other_details = "swish_trained_upto_700_multiBC"
     
     # =========================================================================
+    # ASPECT RATIO CORRECTION FLAG
+    # =========================================================================
+    
+    # Set to True if the ML model was trained on square geometry (e.g., lid-driven cavity)
+    # and you're testing on rectangular geometry (e.g., BFS with lx != ly)
+    # 
+    # True:  Resample rectangular→square before ML, then square→rectangular after ML
+    # False: Use raw data directly (faster, but may reduce accuracy if aspect ratios differ)
+    use_aspect_ratio_correction = True
+    # =========================================================================
+
+    
+    print(f"\n{'='*70}")
+    print(f"CONFIGURATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"Reynolds Number: {Re}")
+    print(f"Fine Mesh: {nx}×{ny}")
+    print(f"Coarse Mesh: {lr_dim}×{lr_dim}")
+    print(f"BFS Geometry: Lx={lx}, Ly={ly} (aspect ratio: {lx/ly:.2f}:1)")
+    print(f"Aspect Ratio Correction: {'ENABLED ✓' if use_aspect_ratio_correction else 'DISABLED'}")
+    if not use_aspect_ratio_correction and lx != ly:
+        print(f"  ⚠️  Note: Testing rectangular geometry with model trained on square")
+        print(f"     If results are poor, try enabling aspect ratio correction")
+    print(f"{'='*70}\n")
+    
+    # =========================================================================
     # BOUNDARY CONDITIONS - BFS setup
     # =========================================================================
     
@@ -1678,7 +1829,8 @@ if __name__ == "__main__":
         Ub=Ub,
         lx=lx,
         ly=ly,
-        relaxation_factors=relaxation_factors
+        relaxation_factors=relaxation_factors,
+        use_aspect_ratio_correction=use_aspect_ratio_correction
     )
     
     # =========================================================================
