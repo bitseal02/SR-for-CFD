@@ -808,7 +808,7 @@ def create_custom_case(mesh_params: Dict, fluid_params: Dict,
 
 
 def create_bfs_case(nx: int = 400, ny: int = 194, dt: float = 2e-3,
-                    scheme: str = 'UPWIND', output_name: str = 'bfs_Re400',
+                    scheme: str = 'UPWIND', output_name: str = 'bfs_Re100',
                     relaxation_factors: Dict[str, float] | None = None):
     """
     Create and solve a Backward-Facing Step (BFS) baseline case (no custom inlet yet).
@@ -825,8 +825,8 @@ def create_bfs_case(nx: int = 400, ny: int = 194, dt: float = 2e-3,
       - Top/Bottom: no-slip walls (u=v=0)
     """
     # Mesh and physics
-    mesh = MeshParameters(nx=nx, ny=ny, lx=10.0, ly=3.0)
-    fluid = FluidProperties(Re=400, rho=1.0)
+    mesh = MeshParameters(nx=nx, ny=ny, lx=20.0, ly=1.94)
+    fluid = FluidProperties(Re=100, rho=1.0)
 
     # Solver settings
     convergence_criteria = {'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6}
@@ -856,8 +856,8 @@ def create_bfs_case(nx: int = 400, ny: int = 194, dt: float = 2e-3,
     solver = CFDSolver(mesh, fluid, solver_settings, bc)
     # Store case metadata for later steps
     solver.case_type = 'BFS'
-    solver.h = 2.0
-    solver.step_height = 1
+    solver.h = 1.0
+    solver.step_height = 0.94
     solver.Ub = 1.0
 
     iterations, time_elapsed = solver.solve(output_name)
@@ -867,11 +867,11 @@ def create_bfs_case(nx: int = 400, ny: int = 194, dt: float = 2e-3,
 # Main execution
 if __name__ == "__main__":
     # Run only Backward-Facing Step (Re=100)
-    print("Backward-Facing Step (Re=400)")
+    print("Backward-Facing Step (Re=100) - UPWIND Scheme")
     print("=" * 60)
 
     solver, iterations, elapsed_time = create_bfs_case(
-        nx=10, ny=10, dt=2e-3, scheme='UPWIND', output_name='bfs_Re400',
+        nx=10, ny=10, dt=2e-3, scheme='UPWIND', output_name='bfs_Re100',
         relaxation_factors={'u': 0.5, 'v': 0.5, 'p': 0.2}
     )
     print(f"Converged in {iterations} iterations ({elapsed_time:.2f} seconds)")
