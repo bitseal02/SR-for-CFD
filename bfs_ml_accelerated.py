@@ -16,7 +16,7 @@ from tensorflow.keras import Model
 import h5py
 import os
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from numba import njit, prange
 from datetime import datetime
 import time
@@ -43,6 +43,34 @@ def create_timestamped_output_dir(base_dir: str = "outputs") -> str:
     output_dir = os.path.join(base_dir, timestamp)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
+
+
+def save_run_summary(filepath: str, info: Dict[str, Dict[str, str]]):
+    """
+    Save simulation configuration and results summary to a text file.
+    
+    Args:
+        filepath: Path to save the summary file
+        info: Dictionary of sections, where each section is a dictionary of key-value pairs
+    """
+    try:
+        with open(filepath, 'w') as f:
+            f.write(f"{'='*70}\n")
+            f.write(f"BFS SIMULATION RUN SUMMARY\n")
+            f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"{'='*70}\n\n")
+            
+            for section, content in info.items():
+                f.write(f"{section.upper()}\n")
+                f.write(f"{'-'*len(section)}\n")
+                for key, value in content.items():
+                    f.write(f"{key:<30}: {value}\n")
+                f.write("\n")
+                
+        print(f"Run summary saved to: {filepath}")
+    except Exception as e:
+        print(f"Failed to save run summary: {e}")
+
 
 
 def standardize_with_stats(arr, mean, std):
@@ -582,7 +610,8 @@ class CFDSolver:
         linear_interpolation(self.Var, self.Ff, self.mesh.nx, self.mesh.ny, 
                            self.mesh.dx, self.mesh.dy)
     
-    def solve(self, output_base_name: str = "output", verbose: bool = True):
+    def solve(self, output_base_name: str = "output", verbose: bool = True, 
+              callback = None, callback_interval: int = 1000):
         """Main solver loop"""
         count = 0
         converged = False
@@ -598,6 +627,10 @@ class CFDSolver:
         while not converged and count < self.settings.max_iterations:
             count += 1
             self._implicit_solve()
+            
+            # Run callback if provided (e.g., for ML vs Normal monitoring)
+            if callback is not None and count % callback_interval == 0:
+                callback(self, count)
             
             if verbose and count % 100 == 0:
                 print(f"{count}", end="")
@@ -1152,7 +1185,9 @@ def run_fine_simulation_with_ml_init(Re: float, nx: int, ny: int,
                                      Ub: float = 1.0,
                                      lx: float = 10.0,
                                      ly: float = 3.0,
-                                     relaxation_factors: Dict[str, float] = None) -> tuple:
+                                     relaxation_factors: Dict[str, float] = None,
+                                     callback = None,
+                                     callback_interval: int = 1000) -> tuple:
     """
     Step 3: Run fine-resolution BFS simulation with ML-predicted initialization
     
@@ -1171,6 +1206,8 @@ def run_fine_simulation_with_ml_init(Re: float, nx: int, ny: int,
         lx: Domain length in x
         ly: Domain length in y
         relaxation_factors: Under-relaxation factors
+        callback: Function to run at intervals
+        callback_interval: Interval for callback execution
     
     Returns:
         (solver, iterations, time_elapsed)
@@ -1232,9 +1269,11 @@ def run_fine_simulation_with_ml_init(Re: float, nx: int, ny: int,
         output_name = f"{output_name}_accelerated"
     
     # Run simulation
-    iterations, time_elapsed = solver.solve(output_name, verbose=True)
+    iterations, time_elapsed = solver.solve(output_name, verbose=True, 
+                                          callback=callback, 
+                                          callback_interval=callback_interval)
     
-    return solver, iterations, time_elapsed
+    return solver, iterations, time_elapsed, solver, iterations, time_elapsed
 
 
 def run_normal_simulation(Re: float, nx: int, ny: int,
@@ -1248,7 +1287,8 @@ def run_normal_simulation(Re: float, nx: int, ny: int,
                          Ub: float = 1.0,
                          lx: float = 10.0,
                          ly: float = 3.0,
-                         relaxation_factors: Dict[str, float] = None) -> tuple:
+                         relaxation_factors: Dict[str, float] = None,
+                         check_interval: int = 1000) -> tuple:
     """
     Run a normal BFS CFD simulation without ML acceleration
     
@@ -1267,6 +1307,7 @@ def run_normal_simulation(Re: float, nx: int, ny: int,
         lx: Domain length in x
         ly: Domain length in y
         relaxation_factors: Under-relaxation factors
+        check_interval: Interval for saving intermediate plots
     
     Returns:
         (solver, iterations, time_elapsed)
@@ -1303,7 +1344,24 @@ def run_normal_simulation(Re: float, nx: int, ny: int,
     if not output_name.endswith("_normal"):
         output_name = f"{output_name}_normal"
     
-    iterations, time_elapsed = solver.solve(output_name, verbose=True)
+    # Callback for normal simulation monitoring
+    def normal_monitor_callback(solver, iteration):
+        print(f"\n[Monitor] Normal Simulation Iteration {iteration}: Saving contours...")
+        
+        # Create Checkpoint Directory
+        checkpoint_dir = os.path.join(os.path.dirname(output_name), "checkpoints_normal")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+             
+        # Plot Contours
+        contour_filename = os.path.join(checkpoint_dir, f"iter_{iteration}_normal_contours.png")
+        try:
+            solver._plot_contours(contour_filename)
+        except Exception as e:
+            print(f"  ⚠️ Warning: Could not plot contours: {e}")
+
+    iterations, time_elapsed = solver.solve(output_name, verbose=True,
+                                          callback=normal_monitor_callback,
+                                          callback_interval=check_interval)
     
     print(f"Normal BFS simulation completed in {iterations} iterations ({time_elapsed:.2f} seconds)")
     
@@ -1407,38 +1465,12 @@ def run_ml_accelerated_fine_simulation(
     relaxation_factors: Dict[str, float] = None,
     use_aspect_ratio_correction: bool = False,
     use_adaptive_normalization: bool = True,
-    blend_factor: float = 0.3
+    blend_factor: float = 0.3,
+    normal_solver = None,
+    check_interval: int = 1000
 ) -> tuple:
     """
     Run ML-accelerated fine BFS simulation using coarse mesh solution
-    
-    Args:
-        coarse_fields: Dictionary with 'u', 'v', 'p' fields from coarse simulation
-        Re: Reynolds number
-        nx, ny: Target fine mesh dimensions
-        lr_dim: Low resolution dimension used for coarse simulation (default: 10)
-        dt: Time step
-        scheme: Numerical scheme
-        convergence_criteria: Convergence criteria dict
-        max_iterations_fine: Maximum iterations for fine mesh simulation
-        output_name: Base name for output files
-        stats_file: Path to standardization stats file
-        encoder_file: Path to encoder model
-        decoder_file: Path to decoder model
-        bc: BoundaryConditions object
-        step_height: BFS step height
-        h: BFS channel height above step
-        Ub: BFS bulk velocity
-        lx: Domain length in x
-        ly: Domain length in y
-        relaxation_factors: Under-relaxation factors
-        use_aspect_ratio_correction: If True, correct for aspect ratio mismatch between
-                                     training (square) and testing (rectangular) geometries
-        use_adaptive_normalization: If True, blend training stats with input data stats
-        blend_factor: Blending weight for adaptive normalization (0.0-1.0, default 0.3)
-    
-    Returns:
-        (solver, iterations, time_elapsed)
     """
     
     print(f"\n{'#'*70}")
@@ -1461,16 +1493,16 @@ def run_ml_accelerated_fine_simulation(
     if output_name is None:
         output_name = f"bfs_Re{Re}_{nx}x{ny}"
     
-    # Verify files exist
-    print("Checking required ML model files...")
-    for fname, desc in [(stats_file, "Stats file"), 
-                        (encoder_file, "Encoder model"), 
-                        (decoder_file, "Decoder model")]:
-        if os.path.exists(fname):
-            print(f"  ✓ {desc}: {fname}")
-        else:
-            print(f"  ✗ {desc}: {fname} NOT FOUND")
-            raise FileNotFoundError(f"{desc} not found: {fname}")
+    # Verify files exist (Moved to main block)
+    # print("Checking required ML model files...")
+    # for fname, desc in [(stats_file, "Stats file"), 
+    #                     (encoder_file, "Encoder model"), 
+    #                     (decoder_file, "Decoder model")]:
+    #     if os.path.exists(fname):
+    #         print(f"  ✓ {desc}: {fname}")
+    #     else:
+    #         print(f"  ✗ {desc}: {fname} NOT FOUND")
+            # We don't raise error here to allow dry runs if files missing, but it will fail later
     
     # STEP 1: ML super-resolution
     hr_fields = ml_super_resolution(
@@ -1486,6 +1518,70 @@ def run_ml_accelerated_fine_simulation(
         use_adaptive_normalization=use_adaptive_normalization,
         blend_factor=blend_factor
     )
+
+    # Monitor Callback for ML Simulation (comparing to Normal Solver)
+    metrics_history = {'iter': [], 'u_diff_rms': [], 'v_diff_rms': [], 'u_diff_max': [], 'v_diff_max': []}
+    
+    def monitor_callback(solver, iteration):
+        # Only run if normal_solver is available
+        if normal_solver is None:
+             return
+
+        print(f"\n[Monitor] Iteration {iteration}: Comparing with Normal simulation...")
+        
+        # 1. Extract centerlines
+        current_centerlines = extract_centerlines(solver, nx, ny)
+        normal_centerlines = extract_centerlines(normal_solver, nx, ny)
+             
+        # Calculate differences
+        u_diff = np.abs(current_centerlines['u_vertical']['values'] - normal_centerlines['u_vertical']['values'])
+        v_diff = np.abs(current_centerlines['v_horizontal']['values'] - normal_centerlines['v_horizontal']['values'])
+             
+        u_rms = np.sqrt(np.mean(u_diff**2))
+        v_rms = np.sqrt(np.mean(v_diff**2))
+        u_max = np.max(u_diff)
+        v_max = np.max(v_diff)
+             
+        # Store metrics
+        metrics_history['iter'].append(iteration)
+        metrics_history['u_diff_rms'].append(u_rms)
+        metrics_history['v_diff_rms'].append(v_rms)
+        metrics_history['u_diff_max'].append(u_max)
+        metrics_history['v_diff_max'].append(v_max)
+             
+        print(f"  Diff RMS: U={u_rms:.6e}, V={v_rms:.6e}")
+             
+        # 3. Create Checkpoint Plots
+        checkpoint_dir = os.path.join(os.path.dirname(output_name), "checkpoints_comparison")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+             
+        plot_filename = os.path.join(checkpoint_dir, f"iter_{iteration}_ML_accelerated_comparison.png")
+             
+        plot_centerline_comparison(
+            current_centerlines, 
+            normal_centerlines, 
+            Re=Re,
+            save_path=plot_filename,
+            bc=bc,
+            show=False  # Do not block execution
+        )
+        
+        # 3b. Plot Contours
+        contour_filename = os.path.join(checkpoint_dir, f"iter_{iteration}_ML_accelerated_contours.png")
+        # Access the private method _plot_contours from the solver instance
+        try:
+            solver._plot_contours(contour_filename)
+        except Exception as e:
+            print(f"  ⚠️ Warning: Could not plot contours: {e}")
+             
+        # 4. Save fields
+        field_filename = os.path.join(checkpoint_dir, f"iter_{iteration}_ML_accelerated_fields.npz")
+        np.savez(field_filename, 
+             u=solver.Var[0, 1:-1, 1:-1].T, 
+             v=solver.Var[1, 1:-1, 1:-1].T,
+             p=solver.Var[2, 1:-1, 1:-1].T,
+             iteration=iteration)
+
     
     # STEP 2: Run fine simulation with ML initialization
     solver, iterations, time_elapsed = run_fine_simulation_with_ml_init(
@@ -1504,8 +1600,24 @@ def run_ml_accelerated_fine_simulation(
         Ub=Ub,
         lx=lx,
         ly=ly,
-        relaxation_factors=relaxation_factors
+        relaxation_factors=relaxation_factors,
+        callback=monitor_callback if normal_solver else None,
+        callback_interval=check_interval
     )
+    
+    # Plot error evolution
+    if len(metrics_history['iter']) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.semilogy(metrics_history['iter'], metrics_history['u_diff_rms'], 'b-o', label='U RMS Diff')
+        plt.semilogy(metrics_history['iter'], metrics_history['v_diff_rms'], 'r-s', label='V RMS Diff')
+        plt.xlabel('Iteration')
+        plt.ylabel('RMS Difference vs Normal Solution')
+        plt.title('Convergence of ML-Accelerated Solution towards Normal Solution')
+        plt.grid(True, which="both", ls="-")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(os.path.dirname(output_name), "error_evolution.png"))
+        plt.close()
     
     print(f"\n{'#'*70}")
     print(f"# ML-ACCELERATED FINE BFS SIMULATION COMPLETE")
@@ -1606,9 +1718,41 @@ def extract_centerlines(solver, nx: int, ny: int) -> Dict[str, Dict[str, np.ndar
     }
 
 
+def compute_centerline_metrics(ml_centerlines: Dict, normal_centerlines: Dict) -> Dict[str, float]:
+    """Compute quantitative difference metrics between centerlines
+    
+    Args:
+        ml_centerlines: Centerline data from ML-accelerated simulation
+        normal_centerlines: Centerline data from normal simulation
+    
+    Returns:
+        Dictionary with metrics: 'u_l2', 'u_max', 'v_l2', 'v_max'
+    """
+    u_ml = ml_centerlines['u_vertical']['values']
+    u_normal = normal_centerlines['u_vertical']['values']
+    v_ml = ml_centerlines['v_horizontal']['values']
+    v_normal = normal_centerlines['v_horizontal']['values']
+    
+    u_diff = u_ml - u_normal
+    v_diff = v_ml - v_normal
+    
+    metrics = {
+        'u_l2': float(np.sqrt(np.mean(u_diff**2))),
+        'u_max': float(np.max(np.abs(u_diff))),
+        'u_mean': float(np.mean(np.abs(u_diff))),
+        'v_l2': float(np.sqrt(np.mean(v_diff**2))),
+        'v_max': float(np.max(np.abs(v_diff))),
+        'v_mean': float(np.mean(np.abs(v_diff)))
+    }
+    
+    return metrics
+
+
 def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict, 
                                Re: float, save_path: str = None, 
-                               bc: Optional[BoundaryConditions] = None):
+                               bc: Optional[BoundaryConditions] = None,
+                               show: bool = True,
+                               iteration: int = None, metrics: Dict = None):
     """
     Plot centerline comparison between ML-accelerated and normal BFS simulations
     
@@ -1618,8 +1762,15 @@ def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict,
         Re: Reynolds number
         save_path: Optional path to save the figure
         bc: BoundaryConditions object (optional, for display in plot)
+        show: Whether to display the plot window
+        iteration: Iteration number to display in title
+        metrics: Optional dictionary of computed metrics to display
     """
     import matplotlib.pyplot as plt
+    
+    # Compute metrics if not provided
+    if metrics is None:
+        metrics = compute_centerline_metrics(ml_centerlines, normal_centerlines)
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
@@ -1633,7 +1784,14 @@ def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict,
              'r--s', linewidth=2, markersize=4, label='Normal', alpha=0.7)
     ax1.set_xlabel('U Velocity', fontsize=12)
     ax1.set_ylabel('Y Position', fontsize=12)
-    ax1.set_title('U Velocity along Vertical Centerline (x=Lx/2)', fontsize=11)
+    title_str = 'U Velocity along Vertical Centerline (x=Lx/2)'
+    if iteration is not None:
+        title_str += f' @ Iter {iteration}'
+    ax1.set_title(title_str, fontsize=11)
+    # Add metrics text box
+    metrics_text = f"L2: {metrics['u_l2']:.2e}\nMax: {metrics['u_max']:.2e}\nMean: {metrics['u_mean']:.2e}"
+    ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes, 
+             fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     ax1.legend(fontsize=10)
     ax1.grid(True, alpha=0.3)
     
@@ -1647,7 +1805,14 @@ def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict,
              'b-o', linewidth=2, markersize=4, label='ML-Accelerated', alpha=0.7)
     ax2.set_xlabel('X Position', fontsize=12)
     ax2.set_ylabel('V Velocity', fontsize=12)
-    ax2.set_title('V Velocity along Horizontal Centerline (y=Ly/2)', fontsize=11)
+    title_str = 'V Velocity along Horizontal Centerline (y=Ly/2)'
+    if iteration is not None:
+        title_str += f' @ Iter {iteration}'
+    ax2.set_title(title_str, fontsize=11)
+    # Add metrics text box
+    metrics_text = f"L2: {metrics['v_l2']:.2e}\nMax: {metrics['v_max']:.2e}\nMean: {metrics['v_mean']:.2e}"
+    ax2.text(0.02, 0.98, metrics_text, transform=ax2.transAxes, 
+             fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
     
@@ -1666,7 +1831,10 @@ def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict,
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Plot saved to: {save_path}")
     
-    plt.show()
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
     
     # Calculate and print differences
     print("\n" + "="*70)
@@ -1686,6 +1854,423 @@ def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict,
     print(f"  Mean absolute difference: {np.mean(v_diff):.6e}")
     print(f"  RMS difference: {np.sqrt(np.mean(v_diff**2)):.6e}")
     print("="*70)
+
+
+def save_checkpoint(iteration: int, solver, checkpoint_dir: str, prefix: str):
+    """Save solver checkpoint at specified iteration
+    
+    Args:
+        iteration: Current iteration number
+        solver: CFDSolver instance
+        checkpoint_dir: Directory to save checkpoints
+        prefix: Prefix for checkpoint files (e.g., 'normal' or 'ml_accelerated')
+    """
+    checkpoint_file = os.path.join(checkpoint_dir, f"{prefix}_checkpoint_iter{iteration}.npz")
+    
+    # Extract fields (internal cells only)
+    u_field = solver.Var[0, 1:-1, 1:-1].T.copy()
+    v_field = solver.Var[1, 1:-1, 1:-1].T.copy()
+    p_field = solver.Var[2, 1:-1, 1:-1].T.copy()
+    
+    np.savez_compressed(checkpoint_file,
+                       iteration=iteration,
+                       u=u_field,
+                       v=v_field,
+                       p=p_field,
+                       nx=solver.mesh.nx,
+                       ny=solver.mesh.ny,
+                       lx=solver.mesh.lx,
+                       ly=solver.mesh.ly,
+                       Re=solver.fluid.Re)
+    
+    print(f"  ✓ Checkpoint saved: {checkpoint_file}")
+
+
+def load_checkpoint(checkpoint_file: str) -> Dict:
+    """Load solver checkpoint from file
+    
+    Args:
+        checkpoint_file: Path to checkpoint file
+    
+    Returns:
+        Dictionary with checkpoint data
+    """
+    data = np.load(checkpoint_file)
+    return {
+        'iteration': int(data['iteration']),
+        'u': data['u'],
+        'v': data['v'],
+        'p': data['p'],
+        'nx': int(data['nx']),
+        'ny': int(data['ny']),
+        'lx': float(data['lx']),
+        'ly': float(data['ly']),
+        'Re': float(data['Re'])
+    }
+
+
+def plot_error_evolution(metrics_history: List[Dict], save_path: str, Re: float):
+    """Plot how errors evolve over iterations
+    
+    Args:
+        metrics_history: List of (iteration, metrics) tuples
+        save_path: Path to save the figure
+        Re: Reynolds number
+    """
+    import matplotlib.pyplot as plt
+    
+    iterations = [m['iteration'] for m in metrics_history]
+    u_l2 = [m['u_l2'] for m in metrics_history]
+    u_max = [m['u_max'] for m in metrics_history]
+    v_l2 = [m['v_l2'] for m in metrics_history]
+    v_max = [m['v_max'] for m in metrics_history]
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # U L2 error
+    axes[0, 0].plot(iterations, u_l2, 'b-o', linewidth=2, markersize=6)
+    axes[0, 0].set_xlabel('Iteration', fontsize=12)
+    axes[0, 0].set_ylabel('L2 Error', fontsize=12)
+    axes[0, 0].set_title('U Velocity L2 Error', fontsize=12, fontweight='bold')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].set_yscale('log')
+    
+    # U Max error
+    axes[0, 1].plot(iterations, u_max, 'b-s', linewidth=2, markersize=6)
+    axes[0, 1].set_xlabel('Iteration', fontsize=12)
+    axes[0, 1].set_ylabel('Max Error', fontsize=12)
+    axes[0, 1].set_title('U Velocity Max Error', fontsize=12, fontweight='bold')
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_yscale('log')
+    
+    # V L2 error
+    axes[1, 0].plot(iterations, v_l2, 'r-o', linewidth=2, markersize=6)
+    axes[1, 0].set_xlabel('Iteration', fontsize=12)
+    axes[1, 0].set_ylabel('L2 Error', fontsize=12)
+    axes[1, 0].set_title('V Velocity L2 Error', fontsize=12, fontweight='bold')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_yscale('log')
+    
+    # V Max error
+    axes[1, 1].plot(iterations, v_max, 'r-s', linewidth=2, markersize=6)
+    axes[1, 1].set_xlabel('Iteration', fontsize=12)
+    axes[1, 1].set_ylabel('Max Error', fontsize=12)
+    axes[1, 1].set_title('V Velocity Max Error', fontsize=12, fontweight='bold')
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].set_yscale('log')
+    
+    plt.suptitle(f'Error Evolution: ML-Accelerated vs Normal (Re={Re})', 
+                 fontsize=14, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n✓ Error evolution plot saved: {save_path}")
+
+
+def run_comparison_with_checkpoints(
+    Re: float,
+    nx: int, ny: int,
+    lr_dim: int = 10,
+    checkpoint_interval: int = 1000,
+    dt: float = 0.002,
+    scheme: str = 'UPWIND',
+    convergence_criteria: Dict[str, float] = None,
+    max_iterations: int = 100000,
+    output_dir: str = None,
+    stats_file: str = None,
+    encoder_file: str = None,
+    decoder_file: str = None,
+    bc: Optional[BoundaryConditions] = None,
+    step_height: float = 1.0,
+    h: float = 2.0,
+    Ub: float = 1.0,
+    lx: float = 10.0,
+    ly: float = 3.0,
+    relaxation_factors: Dict[str, float] = None,
+    use_aspect_ratio_correction: bool = False,
+    use_adaptive_normalization: bool = True,
+    blend_factor: float = 0.3
+):
+    """Run complete comparison workflow with iterative checkpointing
+    
+    This function:
+    1. Runs normal simulation with checkpoints every N iterations
+    2. Runs coarse simulation
+    3. Runs ML-accelerated simulation with checkpoints
+    4. Compares centerlines at each checkpoint
+    5. Generates error evolution plots
+    
+    Args:
+        Re: Reynolds number
+        nx, ny: Fine mesh dimensions
+        lr_dim: Coarse mesh dimension
+        checkpoint_interval: Save checkpoints every N iterations
+        ... (other standard parameters)
+    
+    Returns:
+        Dictionary with output paths and metrics history
+    """
+    print(f"\n{'#'*80}")
+    print(f"# BFS SIMULATION WITH ITERATIVE CHECKPOINT COMPARISON")
+    print(f"# Re={Re}, Fine mesh={nx}x{ny}, Coarse mesh={lr_dim}x{lr_dim}")
+    print(f"# Checkpoint interval: {checkpoint_interval} iterations")
+    print(f"{'#'*80}\n")
+    
+    # Create output directory
+    if output_dir is None:
+        output_dir = create_timestamped_output_dir("outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    plots_dir = os.path.join(output_dir, "checkpoint_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Set defaults
+    if convergence_criteria is None:
+        convergence_criteria = {'u': 1e-6, 'v': 1e-6, 'p': 1e-6}
+    
+    if bc is None:
+        bc = BoundaryConditions()
+        # Setup default BCs
+        bc.u_boundaries['left'] = BoundaryCondition('dirichlet', 0.0)
+        bc.v_boundaries['left'] = BoundaryCondition('dirichlet', 0.0)
+        bc.u_boundaries['right'] = BoundaryCondition('neumann', 0.0)
+        bc.v_boundaries['right'] = BoundaryCondition('neumann', 0.0)
+        bc.p_boundaries['right'] = BoundaryCondition('dirichlet', 0.0)
+        bc.u_boundaries['top'] = BoundaryCondition('dirichlet', 0.0)
+        bc.u_boundaries['bottom'] = BoundaryCondition('dirichlet', 0.0)
+        bc.v_boundaries['top'] = BoundaryCondition('dirichlet', 0.0)
+        bc.v_boundaries['bottom'] = BoundaryCondition('dirichlet', 0.0)
+        bc.p_boundaries['left'] = BoundaryCondition('neumann', 0.0)
+        bc.p_boundaries['top'] = BoundaryCondition('neumann', 0.0)
+        bc.p_boundaries['bottom'] = BoundaryCondition('neumann', 0.0)
+
+    if relaxation_factors is None:
+        relaxation_factors = {'u': 0.7, 'v': 0.7, 'p': 0.3}
+    
+    # ====================
+    # STEP 1: Normal Simulation with Checkpoints
+    # ====================
+    print(f"\n{'='*80}")
+    print(f"STEP 1: Running Normal (Reference) Simulation with Checkpoints")
+    print(f"{'='*80}")
+    
+    mesh = MeshParameters(nx=nx, ny=ny, lx=lx, ly=ly)
+    fluid = FluidProperties(Re=Re, rho=1.0)
+    solver_settings = SolverSettings(dt=dt, scheme=scheme,
+                                    max_iterations=max_iterations,
+                                    convergence_criteria=convergence_criteria,
+                                    relaxation_factors=relaxation_factors)
+    
+    normal_solver = CFDSolver(mesh, fluid, solver_settings, bc,
+                             step_height=step_height, h=h, Ub=Ub)
+    
+    # Checkpoint callback for normal simulation
+    def normal_checkpoint_callback(solver, iteration): 
+        save_checkpoint(iteration, solver, checkpoint_dir, "normal")
+    
+    output_name = os.path.join(output_dir, f"bfs_normal_Re{Re}_{nx}x{ny}")
+    
+    normal_iter, normal_time = normal_solver.solve(
+        output_name, verbose=True,
+        callback=normal_checkpoint_callback,
+        callback_interval=checkpoint_interval
+    )
+    
+    print(f"\n✓ Normal simulation complete: {normal_iter} iterations, {normal_time:.2f}s")
+    
+    # ====================
+    # STEP 2: Coarse Simulation
+    # ====================
+    print(f"\n{'='*80}")
+    print(f"STEP 2: Running Coarse Simulation")
+    print(f"{'='*80}")
+    
+    coarse_fields = run_coarse_simulation(
+        Re=Re, lr_dim=lr_dim, dt=dt, scheme=scheme,
+        convergence_criteria=convergence_criteria,
+        max_iterations=max_iterations,
+        output_dir=output_dir,
+        bc=bc,
+        step_height=step_height, h=h, Ub=Ub,
+        lx=lx, ly=ly,
+        relaxation_factors=relaxation_factors
+    )
+    
+    # ====================
+    # STEP 3: ML Super-Resolution
+    # ====================
+    print(f"\n{'='*80}")
+    print(f"STEP 3: ML Super-Resolution")
+    print(f"{'='*80}")
+    
+    hr_fields = ml_super_resolution(
+        coarse_fields=coarse_fields,
+        lr_dim=lr_dim, hr_dim=nx,
+        stats_file=stats_file,
+        encoder_file=encoder_file,
+        decoder_file=decoder_file,
+        use_aspect_ratio_correction=use_aspect_ratio_correction,
+        lx=lx, ly=ly,
+        use_adaptive_normalization=use_adaptive_normalization,
+        blend_factor=blend_factor
+    )
+    
+    # ====================
+    # STEP 4: ML-Accelerated Simulation with Checkpoints
+    # ====================
+    print(f"\n{'='*80}")
+    print(f"STEP 4: Running ML-Accelerated Simulation with Checkpoints")
+    print(f"{'='*80}")
+    
+    ml_solver = CFDSolver(mesh, fluid, solver_settings, bc,
+                         step_height=step_height, h=h, Ub=Ub)
+    
+    # Initialize with ML predictions
+    print("Injecting ML predictions into solver fields...")
+    ml_solver.Var[0, 1:-1, 1:-1] = hr_fields['u'].T
+    ml_solver.Var[1, 1:-1, 1:-1] = hr_fields['v'].T
+    ml_solver.Var[2, 1:-1, 1:-1] = hr_fields['p'].T
+    
+    for k in range(ml_solver.nVar):
+        ml_solver._apply_bc_wrapper(k)
+    
+    copy_new_to_old(ml_solver.Var, ml_solver.VarOld, ml_solver.nVar,
+                   ml_solver.mesh.nx, ml_solver.mesh.ny)
+    linear_interpolation(ml_solver.Var, ml_solver.Ff,
+                        ml_solver.mesh.nx, ml_solver.mesh.ny,
+                        ml_solver.mesh.dx, ml_solver.mesh.dy)
+    
+    print("  ✓ ML-based initialization complete")
+    
+    # Checkpoint callback for ML simulation
+    def ml_checkpoint_callback(solver, iteration):
+        save_checkpoint(iteration, solver, checkpoint_dir, "ml_accelerated")
+    
+    output_name_ml = os.path.join(output_dir, f"bfs_ml_accelerated_Re{Re}_{nx}x{ny}")
+    ml_iter, ml_time = ml_solver.solve(
+        output_name_ml, verbose=True,
+        callback=ml_checkpoint_callback,
+        callback_interval=checkpoint_interval
+    )
+    
+    print(f"\n✓ ML-accelerated simulation complete: {ml_iter} iterations, {ml_time:.2f}s")
+    
+    # ====================
+    # STEP 5: Generate Comparison Plots at Each Checkpoint
+    # ====================
+    print(f"\n{'='*80}")
+    print(f"STEP 5: Generating Checkpoint Comparison Plots")
+    print(f"{'='*80}")
+    
+    # Find all checkpoint iterations
+    normal_checkpoints = sorted([f for f in os.listdir(checkpoint_dir) if f.startswith("normal_checkpoint")])
+    ml_checkpoints = sorted([f for f in os.listdir(checkpoint_dir) if f.startswith("ml_accelerated_checkpoint")])
+    
+    # Extract iteration numbers
+    def get_iteration(filename):
+        return int(filename.split("iter")[1].split(".")[0])
+    
+    normal_iters = [get_iteration(f) for f in normal_checkpoints]
+    ml_iters = [get_iteration(f) for f in ml_checkpoints]
+    
+    # Find common checkpoints
+    common_iters = sorted(set(normal_iters) & set(ml_iters))
+    
+    print(f"\nFound {len(common_iters)} common checkpoint iterations: {common_iters}")
+    
+    metrics_history = []
+    
+    for iteration in common_iters:
+        print(f"\nProcessing checkpoint at iteration {iteration}...")
+        
+        # Load checkpoints
+        normal_ckpt = load_checkpoint(os.path.join(checkpoint_dir, f"normal_checkpoint_iter{iteration}.npz"))
+        ml_ckpt = load_checkpoint(os.path.join(checkpoint_dir, f"ml_accelerated_checkpoint_iter{iteration}.npz"))
+        
+        # Create temporary solvers for centerline extraction
+        temp_normal_solver = CFDSolver(mesh, fluid, solver_settings, bc,
+                                      step_height=step_height, h=h, Ub=Ub)
+        temp_ml_solver = CFDSolver(mesh, fluid, solver_settings, bc,
+                                  step_height=step_height, h=h, Ub=Ub)
+        
+        # Load fields
+        temp_normal_solver.Var[0, 1:-1, 1:-1] = normal_ckpt['u'].T
+        temp_normal_solver.Var[1, 1:-1, 1:-1] = normal_ckpt['v'].T
+        temp_normal_solver.Var[2, 1:-1, 1:-1] = normal_ckpt['p'].T
+        
+        temp_ml_solver.Var[0, 1:-1, 1:-1] = ml_ckpt['u'].T
+        temp_ml_solver.Var[1, 1:-1, 1:-1] = ml_ckpt['v'].T
+        temp_ml_solver.Var[2, 1:-1, 1:-1] = ml_ckpt['p'].T
+        
+        # Extract centerlines
+        normal_centerlines = extract_centerlines(temp_normal_solver, nx, ny)
+        ml_centerlines = extract_centerlines(temp_ml_solver, nx, ny)
+        
+        # Compute metrics
+        metrics = compute_centerline_metrics(ml_centerlines, normal_centerlines)
+        metrics['iteration'] = iteration
+        metrics_history.append(metrics)
+        
+        print(f"  Metrics - U: L2={metrics['u_l2']:.2e}, Max={metrics['u_max']:.2e}")
+        print(f"           V: L2={metrics['v_l2']:.2e}, Max={metrics['v_max']:.2e}")
+        
+        # Generate comparison plot
+        plot_path = os.path.join(plots_dir, f"centerline_comparison_iter{iteration:06d}.png")
+        plot_centerline_comparison(ml_centerlines, normal_centerlines, Re,
+                                  save_path=plot_path, bc=bc,
+                                  iteration=iteration, metrics=metrics, show=False)
+        print(f"  ✓ Plot saved: {plot_path}")
+    
+    # ====================
+    # STEP 6: Save Metrics and Generate Summary Plot
+    # ====================
+    print(f"\n{'='*80}")
+    print(f"STEP 6: Generating Summary Plots and Saving Metrics")
+    print(f"{'='*80}")
+    
+    # Save metrics to CSV
+    metrics_file = os.path.join(output_dir, "metrics_history.csv")
+    with open(metrics_file, 'w') as f:
+        f.write("iteration,u_l2,u_max,u_mean,v_l2,v_max,v_mean\n")
+        for m in metrics_history:
+            f.write(f"{m['iteration']},{m['u_l2']},{m['u_max']},{m['u_mean']},"
+                   f"{m['v_l2']},{m['v_max']},{m['v_mean']}\n")
+    print(f"\n✓ Metrics saved to: {metrics_file}")
+    
+    # Generate error evolution plot
+    evolution_plot = os.path.join(output_dir, "error_evolution.png")
+    plot_error_evolution(metrics_history, evolution_plot, Re)
+    
+    # ====================
+    # Summary
+    # ====================
+    print(f"\n{'#'*80}")
+    print(f"# COMPARISON WORKFLOW COMPLETE")
+    print(f"#")
+    print(f"# Normal simulation: {normal_iter} iterations ({normal_time:.2f}s)")
+    print(f"# ML-accelerated:    {ml_iter} iterations ({ml_time:.2f}s)")
+    print(f"# Speedup:           {normal_time/ml_time:.2f}x")
+    print(f"# Iteration savings: {normal_iter - ml_iter} iterations ({100*(1-ml_iter/normal_iter):.1f}%)")
+    print(f"#")
+    print(f"# Outputs:")
+    print(f"#   - Checkpoints:         {checkpoint_dir}")
+    print(f"#   - Comparison plots:    {plots_dir}")
+    print(f"#   - Metrics history:     {metrics_file}")
+    print(f"#   - Error evolution:     {evolution_plot}")
+    print(f"{'#'*80}\n")
+    
+    return {
+        'output_dir': output_dir,
+        'checkpoint_dir': checkpoint_dir,
+        'plots_dir': plots_dir,
+        'metrics_history': metrics_history,
+        'normal_iterations': normal_iter,
+        'ml_iterations': ml_iter,
+        'speedup': normal_time / ml_time
+    }
 
 
 # ==============================================================================
@@ -1737,10 +2322,13 @@ if __name__ == "__main__":
     }
     
     # Maximum iterations for different simulations
-    max_iterations_coarse = 100000   # Max iterations for coarse mesh (10x10)
+    max_iterations_coarse = 100   # Max iterations for coarse mesh (10x10)
     max_iterations_fine_ml = 200     # Max iterations for fine mesh with ML initialization
-    max_iterations_normal = 100000   # Max iterations for normal simulation
+    max_iterations_normal = 300   # Max iterations for normal simulation
     
+    # Iteration interval for monitoring and saving plots
+    monitoring_interval = 1000
+
     # Model file suffix
     other_details = "swish_trained_upto_700_multiBC"
     
@@ -1753,7 +2341,8 @@ if __name__ == "__main__":
     # 
     # True:  Resample rectangular→square before ML, then square→rectangular after ML
     # False: Use raw data directly (faster, but may reduce accuracy if aspect ratios differ)
-    use_aspect_ratio_correction = True
+    # Set to False since model is now trained on BFS geometry
+    use_aspect_ratio_correction = False
     
     # =========================================================================
     # ADDITIONAL ML IMPROVEMENTS
@@ -1766,7 +2355,7 @@ if __name__ == "__main__":
     #   0.3 = 30% input data, 70% training stats (default, balanced)
     #   0.5 = 50/50 blend (more aggressive adaptation)
     #   1.0 = Use only input data stats (full adaptation, may be unstable)
-    blend_factor = 0.3
+    blend_factor = 0.0
     
     # =========================================================================
 
@@ -1784,6 +2373,26 @@ if __name__ == "__main__":
         print(f"  ⚠️  Note: Testing rectangular geometry with model trained on square")
         print(f"     If results are poor, try enabling aspect ratio correction")
     print(f"{'='*70}\n")
+    
+    # =========================================================================
+    # PRE-FLIGHT CHECK: ML MODELS
+    # =========================================================================
+
+    print(f"Checking required ML model files...")
+    _stats_file = f"standardization_stats_{lr_dim}to{nx}_{other_details}.txt"
+    _encoder_file = f"vanilla_encoder{lr_dim}_to_{nx}_{other_details}.h5"
+    _decoder_file = f"vanilla_decoder{nx}_from_{lr_dim}_{other_details}.h5"
+
+    for fname, desc in [(_stats_file, "Stats file"), 
+                        (_encoder_file, "Encoder model"), 
+                        (_decoder_file, "Decoder model")]:
+        if os.path.exists(fname):
+            print(f"  ✓ {desc}: {fname}")
+        else:
+            print(f"  ✗ {desc}: {fname} NOT FOUND")
+            print("  ❌ FATAL: Required ML model file missing. Aborting simulation.")
+            sys.exit(1)
+
     
     # =========================================================================
     # BOUNDARY CONDITIONS - BFS setup
@@ -1814,76 +2423,16 @@ if __name__ == "__main__":
     bc.p_boundaries['bottom'] = BoundaryCondition('neumann', 0.0)
     
     # =========================================================================
-    # PART 1A: GENERATE COARSE MESH SOLUTION
+    # PART 1: NORMAL SIMULATION (BASELINE)
     # =========================================================================
     
     print("\n" + "#"*70)
-    print("# PART 1A: GENERATE COARSE MESH BFS SOLUTION")
+    print("# PART 1: NORMAL BFS SIMULATION (BASELINE)")
     print("#"*70)
     
     # Create a single timestamped output directory for this run
     output_dir = create_timestamped_output_dir()
     print(f"All outputs will be saved to: {output_dir}")
-    
-    coarse_fields, output_dir = generate_coarse_mesh_solution(
-        Re=Re,
-        lr_dim=lr_dim,
-        dt=dt,
-        scheme=scheme,
-        convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
-        max_iterations_coarse=max_iterations_coarse,
-        output_dir=output_dir,
-        bc=bc,
-        step_height=step_height,
-        h=h,
-        Ub=Ub,
-        lx=lx,
-        ly=ly,
-        relaxation_factors=relaxation_factors
-    )
-    
-    # =========================================================================
-    # PART 1B: RUN ML-ACCELERATED FINE SIMULATION
-    # =========================================================================
-    
-    print("\n" + "#"*70)
-    print("# PART 1B: ML-ACCELERATED FINE BFS SIMULATION")
-    print("#"*70)
-    
-    solver_ml, iterations_ml, elapsed_time_ml = run_ml_accelerated_fine_simulation(
-        coarse_fields=coarse_fields,
-        Re=Re,
-        nx=nx,
-        ny=ny,
-        lr_dim=lr_dim,
-        dt=dt,
-        scheme=scheme,
-        convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
-        max_iterations_fine=max_iterations_fine_ml,
-        output_name=os.path.join(output_dir, 
-                                f"bfs_Re{Re}_{nx}x{ny}_{max_iterations_coarse}_coarse_{max_iterations_fine_ml}_fine_ML"),
-        stats_file=f"standardization_stats_{lr_dim}to{nx}_{other_details}.txt",
-        encoder_file=f"vanilla_encoder{lr_dim}_to_{nx}_{other_details}.h5",
-        decoder_file=f"vanilla_decoder{nx}_from_{lr_dim}_{other_details}.h5",
-        bc=bc,
-        step_height=step_height,
-        h=h,
-        Ub=Ub,
-        lx=lx,
-        ly=ly,
-        relaxation_factors=relaxation_factors,
-        use_aspect_ratio_correction=use_aspect_ratio_correction,
-        use_adaptive_normalization=True,  # Enable adaptive normalization
-        blend_factor=blend_factor
-    )
-    
-    # =========================================================================
-    # PART 2: NORMAL SIMULATION
-    # =========================================================================
-    
-    print("\n" + "#"*70)
-    print("# PART 2: NORMAL BFS SIMULATION")
-    print("#"*70)
     
     solver_normal, iterations_normal, elapsed_time_normal = run_normal_simulation(
         Re=Re,
@@ -1901,7 +2450,74 @@ if __name__ == "__main__":
         Ub=Ub,
         lx=lx,
         ly=ly,
+        relaxation_factors=relaxation_factors,
+        check_interval=monitoring_interval
+    )
+    
+    # =========================================================================
+    # PART 2A: GENERATE COARSE MESH SOLUTION
+    # =========================================================================
+    
+    print("\n" + "#"*70)
+    print("# PART 2A: GENERATE COARSE MESH BFS SOLUTION")
+    print("#"*70)
+    
+    coarse_fields, _ = generate_coarse_mesh_solution(
+        Re=Re,
+        lr_dim=lr_dim,
+        dt=dt,
+        scheme=scheme,
+        convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
+        max_iterations_coarse=max_iterations_coarse,
+        output_dir=output_dir,
+        bc=bc,
+        step_height=step_height,
+        h=h,
+        Ub=Ub,
+        lx=lx,
+        ly=ly,
         relaxation_factors=relaxation_factors
+    )
+    
+    # =========================================================================
+    # PART 2B: RUN ML-ACCELERATED FINE SIMULATION
+    # =========================================================================
+    
+    print("\n" + "#"*70)
+    print("# PART 2B: ML-ACCELERATED FINE BFS SIMULATION")
+    print("#"*70)
+    
+    # Increase max iterations for ML run to ensure we can track convergence over time
+    # if the user wants to compare iteratively. But we can stop when it converges.
+    # The callback will capture data every check_interval.
+    
+    solver_ml, iterations_ml, elapsed_time_ml = run_ml_accelerated_fine_simulation(
+        coarse_fields=coarse_fields,
+        Re=Re,
+        nx=nx,
+        ny=ny,
+        lr_dim=lr_dim,
+        dt=dt,
+        scheme=scheme,
+        convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
+        max_iterations_fine=max_iterations_normal, # Set to same as normal to allow full comparison if needed
+        output_name=os.path.join(output_dir, 
+                                f"bfs_Re{Re}_{nx}x{ny}_{max_iterations_coarse}_coarse_ML_accelerated"),
+        stats_file=f"standardization_stats_{lr_dim}to{nx}_{other_details}.txt",
+        encoder_file=f"vanilla_encoder{lr_dim}_to_{nx}_{other_details}.h5",
+        decoder_file=f"vanilla_decoder{nx}_from_{lr_dim}_{other_details}.h5",
+        bc=bc,
+        step_height=step_height,
+        h=h,
+        Ub=Ub,
+        lx=lx,
+        ly=ly,
+        relaxation_factors=relaxation_factors,
+        use_aspect_ratio_correction=use_aspect_ratio_correction,
+        use_adaptive_normalization=True,
+        blend_factor=blend_factor,
+        normal_solver=solver_normal,  # Pass normal solver for comparison
+        check_interval=monitoring_interval           # Check every monitoring_interval iterations
     )
     
     # =========================================================================
@@ -1957,3 +2573,37 @@ if __name__ == "__main__":
     print("\n✓ BFS ML-Accelerated Simulation Complete!")
     print("  Testing generalization of lid-driven cavity trained models on BFS geometry")
     print("="*70)
+
+    # Save summary to file
+    summary_info = {
+        "Configuration": {
+            "Reynolds Number": str(Re),
+            "Resolution (Fine)": f"{nx}x{ny}",
+            "Resolution (Coarse)": f"{lr_dim}x{lr_dim}",
+            "Domain Size": f"{lx} x {ly}",
+            "Step Height": str(step_height),
+            "Channel Height (h)": str(h),
+            "Diff. Scheme": scheme,
+            "Time Step": str(dt)
+        },
+        "ML Acceleration Settings": {
+            "Stats File": f"standardization_stats_{lr_dim}to{nx}_{other_details}.txt",
+            "Encoder File": f"vanilla_encoder{lr_dim}_to_{nx}_{other_details}.h5",
+            "Decoder File": f"vanilla_decoder{nx}_from_{lr_dim}_{other_details}.h5",
+            "Aspect Ratio Correction": str(use_aspect_ratio_correction),
+            "Adaptive Normalization": f"True (Blend: {blend_factor})", 
+        },
+        "Results": {
+            "Normal Iterations": str(iterations_normal),
+            "Normal Time (s)": f"{elapsed_time_normal:.2f}",
+            "Coarse Iterations": str(max_iterations_coarse),
+            "ML+Fine Iterations": str(iterations_ml),
+            "ML+Fine Time (s)": f"{elapsed_time_ml:.2f}",
+            "Speedup Factor": f"{elapsed_time_normal/elapsed_time_ml:.2f}x",
+            "Iterations Saved": f"{iterations_normal - iterations_ml}",
+            "Output Directory": output_dir
+        }
+    }
+    
+    save_run_summary(os.path.join(output_dir, "run_summary.txt"), summary_info)
+
