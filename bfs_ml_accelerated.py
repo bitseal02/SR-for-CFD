@@ -2704,6 +2704,7 @@ if __name__ == "__main__":
     # PART 3: EXTRACTING CENTERLINES
     # =========================================================================
     
+    
     print("\n" + "#"*70)
     print("# PART 3: EXTRACTING CENTERLINES")
     print("#"*70)
