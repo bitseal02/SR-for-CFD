@@ -82,7 +82,7 @@ def save_run_summary(filepath: str, info: Dict[str, Dict[str, str]]):
         info: Dictionary of sections, where each section is a dictionary of key-value pairs
     """
     try:
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             f.write(f"{'='*70}\n")
             f.write(f"BFS SIMULATION RUN SUMMARY\n")
             f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -219,6 +219,78 @@ def denormalize_with_stats_3channel(arr_3ch: np.ndarray, stats: Dict) -> np.ndar
         mean, std = stats[ch_name]
         denormalized[..., ch_idx] = arr_3ch[..., ch_idx] * std + mean
     return denormalized
+
+
+def normalize_per_sample(arr: np.ndarray):
+    """
+    Per-sample Z-score normalization of 3-channel flow fields.
+
+    Args:
+        arr: (N, H, W, 3) array with channels [u, v, p]
+    Returns:
+        (normalized, stats) where stats has shape (N, 3, 2) — per-channel [mean, std]
+    """
+    arr = arr.astype(np.float32)
+    N = arr.shape[0]
+    stats = np.zeros((N, 3, 2), dtype=np.float32)
+    normalized = np.copy(arr)
+    for i in range(N):
+        for c in range(3):
+            mean = arr[i, :, :, c].mean()
+            std = float(arr[i, :, :, c].std())
+            if std < 1e-8:
+                std = 1e-8
+            stats[i, c, 0] = mean
+            stats[i, c, 1] = std
+            normalized[i, :, :, c] = (arr[i, :, :, c] - mean) / std
+    return normalized, stats
+
+
+def denormalize_per_sample(arr: np.ndarray, stats: np.ndarray) -> np.ndarray:
+    """
+    Inverse per-sample normalization.
+
+    Args:
+        arr: (N, H, W, 3) normalized array
+        stats: (N, 3, 2) array from normalize_per_sample
+    Returns:
+        Denormalized (N, H, W, 3) array
+    """
+    result = np.copy(arr).astype(np.float32)
+    N = arr.shape[0]
+    for i in range(N):
+        for c in range(3):
+            mean = stats[i, c, 0]
+            std = stats[i, c, 1]
+            result[i, :, :, c] = arr[i, :, :, c] * std + mean
+    return result
+
+
+def make_coord_channels_batch(dim: int, lx_arr, ly_arr) -> np.ndarray:
+    """
+    Generate normalized coordinate channels for a batch of samples.
+
+    Encoding: x̄ = x / max(lx, ly),  ȳ = y / max(lx, ly)  (aspect-ratio preserving)
+
+    Args:
+        dim: Grid dimension (square grid dim×dim)
+        lx_arr: List/array of lx values, one per sample
+        ly_arr: List/array of ly values, one per sample
+    Returns:
+        (N, dim, dim, 2) array of coordinate channels [x̄, ȳ]
+    """
+    N = len(lx_arr)
+    coords = np.zeros((N, dim, dim, 2), dtype=np.float32)
+    for i in range(N):
+        lx = lx_arr[i]
+        ly = ly_arr[i]
+        L = max(lx, ly)
+        x = np.linspace(0, lx, dim) / L
+        y = np.linspace(0, ly, dim) / L
+        xx, yy = np.meshgrid(x, y)  # both (dim, dim)
+        coords[i, :, :, 0] = xx
+        coords[i, :, :, 1] = yy
+    return coords
 
 
 def reshape_rectangular_to_square(fields: Dict[str, np.ndarray], 
@@ -1142,191 +1214,134 @@ def run_coarse_simulation(Re: float, lr_dim: int = 10,
 
 def ml_super_resolution_unet(coarse_fields: Dict[str, np.ndarray], 
                              lr_dim: int, hr_dim: int,
-                             stats_file: str,
                              stage_dims: List[int],
                              model_name_pattern: str,
-                             use_aspect_ratio_correction: bool = False,
-                             lx: float = 1.0, ly: float = 1.0,
-                             use_adaptive_normalization: bool = False,
-                             blend_factor: float = 0.0) -> Dict[str, np.ndarray]:
+                             lx: float = 1.0, ly: float = 1.0) -> Dict[str, np.ndarray]:
     """
-    Step 2: Use cascaded U-Net models to super-resolve coarse simulation to fine resolution
-    
-    Cascaded inference: 10→20→40→80→200→400 (5 stages)
-    
+    Step 2: Use cascaded U-Net models to super-resolve coarse simulation to fine resolution.
+
+    Uses per-sample Z-score normalization and 5-channel input [u, v, p, x̄, ȳ] where
+    coordinate channels encode the physical geometry (aspect-ratio preserving).
+
+    Cascaded inference: lr_dim → stage_dims[-1] (e.g. 10→20→40→80→200→400)
+
     Args:
         coarse_fields: Dictionary with 'u', 'v', 'p' arrays of shape (lr_dim, lr_dim)
         lr_dim: Low resolution dimension (e.g., 10)
         hr_dim: High resolution dimension (e.g., 400)
-        stats_file: Path to 3-channel normalization statistics file
         stage_dims: List of intermediate dimensions (e.g., [20, 40, 80, 200, 400])
         model_name_pattern: Pattern for stage model filenames (e.g., "unet_stage_{from_dim}to{to_dim}_NAME.h5")
-        use_aspect_ratio_correction: If True, correct for aspect ratio mismatch
-        lx, ly: Physical domain dimensions (for aspect ratio correction)
-        use_adaptive_normalization: If True, blend training stats with input data stats
-        blend_factor: Blending weight for adaptive normalization (0.0-1.0, default 0.0)
-    
+        lx, ly: Physical domain dimensions (used for coordinate channel encoding)
+
     Returns:
         Dictionary with 'u', 'v', 'p' fields of shape (hr_dim, hr_dim)
     """
     print(f"\n{'='*70}")
     print(f"STEP 2: ML Super-Resolution - Progressive U-Net ({lr_dim}x{lr_dim} -> {hr_dim}x{hr_dim})")
     print(f"  Cascaded stages: {lr_dim} → {' → '.join(map(str, stage_dims))}")
-    if use_aspect_ratio_correction:
-        print(f"  ⚙️  Aspect Ratio Correction: ENABLED")
-        print(f"  Physical domain: {lx}×{ly} (aspect ratio: {lx/ly:.2f}:1)")
-    else:
-        print(f"  ⚙️  Aspect Ratio Correction: DISABLED")
-    if use_adaptive_normalization:
-        print(f"  ⚙️  Adaptive Normalization: ENABLED (blend={blend_factor:.2f})")
+    print(f"  Per-sample normalization: ENABLED")
+    print(f"  Coordinate channels: ENABLED  (lx={lx}, ly={ly})")
     print(f"{'='*70}")
-    
-    # STEP 2.1: Aspect ratio correction (if enabled)
-    coarse_fields_for_ml = coarse_fields
-    if use_aspect_ratio_correction and (lx != ly):
-        print(f"\n[Aspect Ratio Correction - Pre-ML]")
-        coarse_fields_for_ml = reshape_rectangular_to_square(
-            coarse_fields, lr_dim, lr_dim, lx, ly
-        )
-    
-    # Load 3-channel normalization statistics
-    print(f"\nLoading 3-channel normalization stats from '{stats_file}'...")
-    stats = {}
-    try:
-        with open(stats_file, "r") as f:
-            for line in f:
-                # Skip comments and empty lines
-                if line.strip().startswith('#') or not line.strip():
-                    continue
-                parts = line.strip().split()
-                if len(parts) == 3:  # Format: channel mean std
-                    channel, mean, std = parts
-                    stats[channel] = (float(mean), float(std))
-        
-        print(f"  ✓ 3-channel stats loaded:")
-        for ch in ['u', 'v', 'p']:
-            mean, std = stats[ch]
-            print(f"    {ch.upper()}: mean={mean:.6f}, std={std:.6f}")
-            
-    except FileNotFoundError:
-        print(f"❌ FATAL: Stats file '{stats_file}' not found.")
-        raise
-    except (KeyError, ValueError) as e:
-        print(f"❌ FATAL: Error parsing stats file: {e}")
-        raise
-    
-    # Stack fields into 3-channel format: (H, W, 3) with channels [u, v, p]
-    print(f"\nPreparing 3-channel input...")
+
+    # Stack fields into (1, lr_dim, lr_dim, 3) — batch of one sample
     x_lr_3ch = np.stack([
-        coarse_fields_for_ml['u'],
-        coarse_fields_for_ml['v'],
-        coarse_fields_for_ml['p']
-    ], axis=-1).astype(np.float32)  # Shape: (lr_dim, lr_dim, 3)
-    
-    print(f"  3-channel input shape: {x_lr_3ch.shape}")
+        coarse_fields['u'],
+        coarse_fields['v'],
+        coarse_fields['p']
+    ], axis=-1).astype(np.float32)  # (lr_dim, lr_dim, 3)
+    x_lr_batch = x_lr_3ch[np.newaxis]  # (1, lr_dim, lr_dim, 3)
+
+    print(f"\nPreparing 5-channel input...")
+    print(f"  Flow field shape: {x_lr_batch.shape}")
     print(f"  Value ranges: U=[{x_lr_3ch[...,0].min():.4f}, {x_lr_3ch[...,0].max():.4f}], "
           f"V=[{x_lr_3ch[...,1].min():.4f}, {x_lr_3ch[...,1].max():.4f}], "
           f"P=[{x_lr_3ch[...,2].min():.4f}, {x_lr_3ch[...,2].max():.4f}]")
-    
-    # Adaptive normalization (optional)
-    if use_adaptive_normalization and blend_factor > 0:
-        print(f"\n  Applying adaptive normalization (blend={blend_factor:.2f})...")
-        for ch_idx, ch_name in enumerate(['u', 'v', 'p']):
-            input_mean = np.mean(x_lr_3ch[..., ch_idx])
-            input_std = np.std(x_lr_3ch[..., ch_idx])
-            
-            mean_orig, std_orig = stats[ch_name]
-            mean_blended = (1 - blend_factor) * mean_orig + blend_factor * input_mean
-            std_blended = (1 - blend_factor) * std_orig + blend_factor * max(input_std, 1e-8)
-            
-            stats[ch_name] = (mean_blended, std_blended)
-            print(f"    {ch_name.upper()}: Input mean={input_mean:.6f}, std={input_std:.6f}")
-            print(f"           Blended mean={mean_blended:.6f}, std={std_blended:.6f}")
-    
-    # Normalize
-    x_lr_norm = normalize_with_stats_3channel(x_lr_3ch, stats)
-    x_current = np.expand_dims(x_lr_norm, axis=0)  # Add batch dimension: (1, lr_dim, lr_dim, 3)
-    
+
+    # Per-sample Z-score normalization
+    x_lr_norm, sample_stats = normalize_per_sample(x_lr_batch)  # (1, lr_dim, lr_dim, 3), (1, 3, 2)
+    print(f"  Per-sample stats computed:")
+    ch_names = ['U', 'V', 'P']
+    for c, name in enumerate(ch_names):
+        print(f"    {name}: mean={sample_stats[0,c,0]:.6f}, std={sample_stats[0,c,1]:.6f}")
+
+    # Generate coordinate channels at lr_dim resolution and concatenate → 5-channel input
+    coords = make_coord_channels_batch(lr_dim, [lx], [ly])  # (1, lr_dim, lr_dim, 2)
+    x_current = np.concatenate([x_lr_norm, coords], axis=-1)  # (1, lr_dim, lr_dim, 5)
+    print(f"  5-channel input shape: {x_current.shape}")
+
     # Load and run cascaded U-Net stages
     print(f"\nLoading and running {len(stage_dims)} U-Net stages...")
-    
+
     prev_dim = lr_dim
     for stage_idx, target_dim in enumerate(stage_dims):
         stage_name = f"{prev_dim}to{target_dim}"
         model_file = model_name_pattern.format(from_dim=prev_dim, to_dim=target_dim)
-        
+
         print(f"\n  Stage {stage_idx+1}/{len(stage_dims)}: {stage_name}")
         print(f"    Loading model: {model_file}")
-        
+
         if not os.path.exists(model_file):
             print(f"    ❌ ERROR: Model file not found!")
             raise FileNotFoundError(f"U-Net stage model not found: {model_file}")
-        
-        # Load stage model (U-Net only - predicts residuals)
+
         try:
             unet_model = tf.keras.models.load_model(model_file, compile=False)
             print(f"    ✓ U-Net model loaded successfully")
         except Exception as e:
             print(f"    ❌ ERROR loading model: {e}")
             raise
-        
-        # CRITICAL FIX: Apply the InterpolateRefineModel logic manually
-        # Step 1: Bicubic interpolation from prev_dim to target_dim
-        print(f"    Interpolating: {x_current.shape} → (1, {target_dim}, {target_dim}, 3)")
-        x_interpolated = bicubic_interpolate_batch(x_current, (target_dim, target_dim))
-        print(f"    ✓ Interpolated shape: {x_interpolated.shape}")
-        
-        # Step 2: Predict residual correction using U-Net
+
+        # Apply InterpolateRefineModel logic manually on 5-channel input:
+        # Step 1: Bicubic interpolation (5-ch) from prev_dim to target_dim
+        print(f"    Interpolating: {x_current.shape} → (1, {target_dim}, {target_dim}, 5)")
+        x_interp = bicubic_interpolate_batch(x_current, (target_dim, target_dim))
+        print(f"    ✓ Interpolated shape: {x_interp.shape}")
+
+        # Step 2: U-Net predicts residual from 5-ch interpolated input → 3-ch output
         print(f"    Predicting residual correction...")
-        residual = unet_model.predict(x_interpolated, verbose=0)
-        
-        # Step 3: Scale down residual (matching training behavior)
+        residual = unet_model.predict(x_interp, verbose=0)  # (1, target_dim, target_dim, 3)
+
+        # Step 3: Scale residual and add to interpolated flow channels
         residual = residual * 0.1
-        
-        # Step 4: Add residual to interpolated (residual learning)
-        x_current = x_interpolated + residual
-        
-        print(f"    ✓ Output shape: {x_current.shape}")
-        print(f"    Value ranges: U=[{x_current[0,...,0].min():.4f}, {x_current[0,...,0].max():.4f}], "
-              f"V=[{x_current[0,...,1].min():.4f}, {x_current[0,...,1].max():.4f}], "
-              f"P=[{x_current[0,...,2].min():.4f}, {x_current[0,...,2].max():.4f}]")
-        
+        x_flow = x_interp[..., :3] + residual  # (1, target_dim, target_dim, 3)
+
+        print(f"    ✓ Flow output shape: {x_flow.shape}")
+        print(f"    Value ranges: U=[{x_flow[0,...,0].min():.4f}, {x_flow[0,...,0].max():.4f}], "
+              f"V=[{x_flow[0,...,1].min():.4f}, {x_flow[0,...,1].max():.4f}], "
+              f"P=[{x_flow[0,...,2].min():.4f}, {x_flow[0,...,2].max():.4f}]")
+
         # Check for NaN/Inf
-        if np.isnan(x_current).any() or np.isinf(x_current).any():
-            nan_count = np.isnan(x_current).sum()
-            inf_count = np.isinf(x_current).sum()
+        if np.isnan(x_flow).any() or np.isinf(x_flow).any():
+            nan_count = np.isnan(x_flow).sum()
+            inf_count = np.isinf(x_flow).sum()
             print(f"    ⚠️  WARNING: Stage output contains {nan_count} NaN and {inf_count} Inf values!")
             print(f"    Replacing with zeros to prevent propagation...")
-            x_current = np.nan_to_num(x_current, nan=0.0, posinf=0.0, neginf=0.0)
-        
+            x_flow = np.nan_to_num(x_flow, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Reattach coord channels at target resolution for the next stage input
+        if stage_idx < len(stage_dims) - 1:
+            coords_new = make_coord_channels_batch(target_dim, [lx], [ly])  # (1, target_dim, target_dim, 2)
+            x_current = np.concatenate([x_flow, coords_new], axis=-1)  # 5-ch for next stage
+        else:
+            x_current = x_flow  # final 3-ch output — no coord channels needed
+
         prev_dim = target_dim
-    
-    # Final output: (1, hr_dim, hr_dim, 3)
-    hr_3ch_norm = x_current[0]  # Remove batch dimension
-    
-    # Denormalize
-    print(f"\nDenormalizing output...")
-    hr_3ch_real = denormalize_with_stats_3channel(hr_3ch_norm, stats)
-    
-    # Unstack channels back to separate fields
+
+    # Denormalize using per-sample stats computed from the original coarse input
+    print(f"\nDenormalizing output using per-sample stats...")
+    hr_3ch_real = denormalize_per_sample(x_current, sample_stats)  # (1, hr_dim, hr_dim, 3)
+
     hr_fields = {
-        'u': hr_3ch_real[..., 0],
-        'v': hr_3ch_real[..., 1],
-        'p': hr_3ch_real[..., 2]
+        'u': hr_3ch_real[0, ..., 0],
+        'v': hr_3ch_real[0, ..., 1],
+        'p': hr_3ch_real[0, ..., 2]
     }
-    
+
     print(f"  Final output ranges:")
     print(f"    U: [{hr_fields['u'].min():.6f}, {hr_fields['u'].max():.6f}]")
     print(f"    V: [{hr_fields['v'].min():.6f}, {hr_fields['v'].max():.6f}]")
     print(f"    P: [{hr_fields['p'].min():.6f}, {hr_fields['p'].max():.6f}]")
-    
-    # STEP 2.2: Reverse aspect ratio correction (if enabled)
-    if use_aspect_ratio_correction and (lx != ly):
-        print(f"\n[Aspect Ratio Correction - Post-ML]")
-        hr_fields = reshape_square_to_rectangular(
-            hr_fields, hr_dim, hr_dim, lx, ly
-        )
-    
+
     print(f"\n  ✓ Progressive U-Net super-resolution complete")
     return hr_fields
 
@@ -1616,7 +1631,6 @@ def run_ml_accelerated_fine_simulation_unet(
     convergence_criteria: Dict[str, float] = None,
     max_iterations_fine: int = 100000,
     output_name: str = None,
-    stats_file: str = None,
     stage_dims: List[int] = None,
     model_name_pattern: str = None,
     bc: Optional[BoundaryConditions] = None,
@@ -1626,9 +1640,6 @@ def run_ml_accelerated_fine_simulation_unet(
     lx: float = 10.0,
     ly: float = 3.0,
     relaxation_factors: Dict[str, float] = None,
-    use_aspect_ratio_correction: bool = False,
-    use_adaptive_normalization: bool = False,
-    blend_factor: float = 0.0,
     normal_solver = None,
     check_interval: int = 1000
 ) -> tuple:
@@ -1645,7 +1656,6 @@ def run_ml_accelerated_fine_simulation_unet(
         convergence_criteria: Convergence criteria dict
         max_iterations_fine: Maximum iterations for fine mesh simulation
         output_name: Base name for output files
-        stats_file: Path to 3-channel normalization stats file
         stage_dims: List of intermediate dimensions (e.g., [20, 40, 80, 200, 400])
         model_name_pattern: Pattern for stage model filenames
         bc: BoundaryConditions object
@@ -1655,9 +1665,6 @@ def run_ml_accelerated_fine_simulation_unet(
         lx: Domain length in x
         ly: Domain length in y
         relaxation_factors: Under-relaxation factors
-        use_aspect_ratio_correction: If True, correct for aspect ratio mismatch
-        use_adaptive_normalization: If True, blend training stats with input data stats
-        blend_factor: Blending weight for adaptive normalization (0.0-1.0)
         normal_solver: Optional converged normal solver for reference comparison
         check_interval: Interval for checkpointing and comparison
     
@@ -1669,53 +1676,40 @@ def run_ml_accelerated_fine_simulation_unet(
     print(f"# ML-ACCELERATED FINE BFS SIMULATION (Progressive U-Net)")
     print(f"# Re={Re}, Target Resolution={nx}x{ny}")
     print(f"# Using coarse solution from {lr_dim}x{lr_dim}")
-    if use_aspect_ratio_correction:
-        print(f"# Aspect Ratio Correction: ENABLED")
-    else:
-        print(f"# Aspect Ratio Correction: DISABLED")
     print(f"{'#'*70}\n")
     
     # Set default parameters if not provided
     if stage_dims is None:
         stage_dims = [20, 40, 80, 200, 400]
-    if stats_file is None:
-        # FIXED: Match the actual filename from notebook
-        stats_file = f"norm_stats_{lr_dim}to{stage_dims[-1]}_progressive_residual_unet_(20-40-80-200-400)_trained_single_and_double_LDC_and_one_bfs.txt"
     if model_name_pattern is None:
         # FIXED: Match the actual filename pattern from notebook
         model_name_pattern = "unet_stage_{from_dim}to{to_dim}_progressive_residual_unet_(20-40-80-200-400)_trained_single_and_double_LDC_and_one_bfs.h5"
     if output_name is None:
         output_name = f"bfs_Re{Re}_{nx}x{ny}"
     
-    # Verify files exist (Checking moved to main block)
-    # print("Checking required ML model files...")
-    # print(f"  Stats file: {stats_file}")
-    # if not os.path.exists(stats_file):
-    #     print(f"  ✗ Stats file NOT FOUND")
-    #     # We don't raise error here to allow dry runs if files missing, but it will fail later
-    # else:
-    #     print(f"  ✓ Stats file found")
-    
-    # Check stage models
-    # model_files = []
-    # prev_dim = lr_dim
-    # for target_dim in stage_dims:
-    #     model_file = model_name_pattern.format(from_dim=prev_dim, to_dim=target_dim)
-    #     model_files.append(model_file)
-    
     # STEP 1: ML super-resolution (U-Net)
     hr_fields = ml_super_resolution_unet(
         coarse_fields=coarse_fields,
         lr_dim=lr_dim,
         hr_dim=nx,
-        stats_file=stats_file,
         stage_dims=stage_dims,
         model_name_pattern=model_name_pattern,
-        use_aspect_ratio_correction=use_aspect_ratio_correction,
+        lx=lx,
+        ly=ly
+    )
+
+    # Plot LR input / HR predicted (+ HR ground truth when available)
+    sr_plot_dir = os.path.join(os.path.dirname(output_name), 'sr_comparison')
+    print(f"\nGenerating super-resolution comparison plots → {sr_plot_dir}")
+    plot_ml_sr_comparison(
+        coarse_fields=coarse_fields,
+        hr_fields=hr_fields,
+        lr_dim=lr_dim,
+        hr_dim=nx,
         lx=lx,
         ly=ly,
-        use_adaptive_normalization=use_adaptive_normalization,
-        blend_factor=blend_factor
+        save_dir=sr_plot_dir,
+        normal_solver=normal_solver  # None → 2-panel plot; solver → 3-panel with ground truth
     )
 
     # Monitor Callback for ML Simulation (comparing to Normal Solver)
@@ -1944,6 +1938,134 @@ def compute_centerline_metrics(ml_centerlines: Dict, normal_centerlines: Dict) -
     }
     
     return metrics
+
+
+def plot_ml_sr_comparison(coarse_fields: Dict[str, np.ndarray],
+                          hr_fields: Dict[str, np.ndarray],
+                          lr_dim: int, hr_dim: int,
+                          lx: float, ly: float,
+                          save_dir: str,
+                          normal_solver=None) -> None:
+    """
+    Plot LR input / HR predicted (and optionally HR ground truth) for each of u, v, p.
+
+    Produces 3 PNG files (one per variable) saved to save_dir.
+    When normal_solver is provided: 3 subplots (LR input | HR ground | HR predicted).
+    When normal_solver is None:     2 subplots (LR input | HR predicted).
+    Contourf style matches _plot_contours.
+
+    Args:
+        coarse_fields: {'u','v','p'} arrays of shape (lr_dim, lr_dim)
+        hr_fields:     {'u','v','p'} ML super-resolution output, shape (hr_dim, hr_dim)
+        lr_dim, hr_dim: Grid dimensions
+        lx, ly: Physical domain lengths
+        save_dir: Directory to save the plots
+        normal_solver: Optional converged CFDSolver at fine resolution (HR ground truth)
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    var_info = [
+        ('u', 'U Velocity',  'RdBu'),
+        ('v', 'V Velocity',  'RdBu'),
+        ('p', 'Pressure',    'viridis'),
+    ]
+
+    have_ground = normal_solver is not None
+
+    # Build HR ground-truth arrays from the solver (if available)
+    ground = {}
+    if have_ground:
+        ground = {
+            'u': normal_solver.Var[0, 1:-1, 1:-1].T.copy(),
+            'v': normal_solver.Var[1, 1:-1, 1:-1].T.copy(),
+            'p': normal_solver.Var[2, 1:-1, 1:-1].T.copy(),
+        }
+
+    print(f"\n{'='*70}")
+    print(f"ML SUPER-RESOLUTION FIELD COMPARISON")
+    print(f"{'='*70}")
+    for key in ['u', 'v', 'p']:
+        lr = coarse_fields[key]
+        hr = hr_fields[key]
+        print(f"  {key.upper()}:")
+        print(f"    LR  input : [{lr.min():.6f}, {lr.max():.6f}]  (mean {lr.mean():.6f})")
+        if have_ground:
+            gt = ground[key]
+            print(f"    HR  ground: [{gt.min():.6f}, {gt.max():.6f}]  (mean {gt.mean():.6f})")
+        print(f"    HR  pred  : [{hr.min():.6f}, {hr.max():.6f}]  (mean {hr.mean():.6f})")
+    print(f"{'='*70}")
+
+    # Coordinate grids
+    x_lr = np.linspace(0, lx, lr_dim)
+    y_lr = np.linspace(0, ly, lr_dim)
+    X_lr, Y_lr = np.meshgrid(x_lr, y_lr)
+
+    x_hr = np.linspace(0, lx, hr_dim)
+    y_hr = np.linspace(0, ly, hr_dim)
+    X_hr, Y_hr = np.meshgrid(x_hr, y_hr)
+
+    n_cols = 3 if have_ground else 2
+
+    for key, label, cmap in var_info:
+        lr_data = coarse_fields[key]   # (lr_dim, lr_dim)
+        pr_data = hr_fields[key]       # (hr_dim, hr_dim)
+
+        vmin_lr = lr_data.min()
+        vmax_lr = lr_data.max()
+
+        if have_ground:
+            gt_data = ground[key]
+            vmin_hr = min(gt_data.min(), pr_data.min())
+            vmax_hr = max(gt_data.max(), pr_data.max())
+        else:
+            vmin_hr = pr_data.min()
+            vmax_hr = pr_data.max()
+
+        ar = lx / ly  # physical aspect ratio for figure sizing
+        col_w = max(4.0, min(8.0, 6.0 * ar))
+        row_h = max(1.5, min(6.0, col_w / ar))
+        fig, axes = plt.subplots(1, n_cols, figsize=(col_w * n_cols + 1.5, row_h + 1.2))
+
+        # --- LR input ---
+        im0 = axes[0].contourf(X_lr, Y_lr, lr_data, levels=20, cmap=cmap,
+                               vmin=vmin_lr, vmax=vmax_lr)
+        axes[0].set_title(f'LR Input ({lr_dim}×{lr_dim})', fontsize=11)
+        axes[0].set_xlabel('X')
+        axes[0].set_ylabel('Y')
+        axes[0].set_aspect('equal')
+        plt.colorbar(im0, ax=axes[0])
+
+        if have_ground:
+            # --- HR ground truth ---
+            im1 = axes[1].contourf(X_hr, Y_hr, gt_data, levels=20, cmap=cmap,
+                                   vmin=vmin_hr, vmax=vmax_hr)
+            axes[1].set_title(f'HR Ground Truth ({hr_dim}×{hr_dim})', fontsize=11)
+            axes[1].set_xlabel('X')
+            axes[1].set_ylabel('Y')
+            axes[1].set_aspect('equal')
+            plt.colorbar(im1, ax=axes[1])
+            pred_ax = axes[2]
+            title_suffix = 'LR Input / HR Ground / HR Predicted'
+        else:
+            pred_ax = axes[1]
+            title_suffix = 'LR Input / HR Predicted'
+
+        # --- HR predicted ---
+        im_pred = pred_ax.contourf(X_hr, Y_hr, pr_data, levels=20, cmap=cmap,
+                                   vmin=vmin_hr, vmax=vmax_hr)
+        pred_ax.set_title(f'HR Predicted ({hr_dim}×{hr_dim})', fontsize=11)
+        pred_ax.set_xlabel('X')
+        pred_ax.set_ylabel('Y')
+        pred_ax.set_aspect('equal')
+        plt.colorbar(im_pred, ax=pred_ax)
+
+        fig.suptitle(f'{label} — {title_suffix}  (Lx={lx}, Ly={ly})',
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        out_path = os.path.join(save_dir, f'sr_comparison_{key}.png')
+        plt.savefig(out_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved: {out_path}")
 
 
 def plot_centerline_comparison(ml_centerlines: Dict, normal_centerlines: Dict, 
@@ -2175,7 +2297,6 @@ def run_comparison_with_checkpoints(
     convergence_criteria: Dict[str, float] = None,
     max_iterations: int = 100000,
     output_dir: str = None,
-    stats_file: str = None,
     stage_dims: List[int] = None,
     model_name_pattern: str = None,
     bc: Optional[BoundaryConditions] = None,
@@ -2184,10 +2305,7 @@ def run_comparison_with_checkpoints(
     Ub: float = 1.0,
     lx: float = 10.0,
     ly: float = 3.0,
-    relaxation_factors: Dict[str, float] = None,
-    use_aspect_ratio_correction: bool = False,
-    use_adaptive_normalization: bool = False,
-    blend_factor: float = 0.0
+    relaxation_factors: Dict[str, float] = None
 ):
     """Run complete comparison workflow with iterative checkpointing
     
@@ -2230,9 +2348,6 @@ def run_comparison_with_checkpoints(
         convergence_criteria = {'u': 1e-6, 'v': 1e-6, 'p': 1e-6}
     if stage_dims is None:
         stage_dims = [20, 40, 80, 200, 400]
-    if stats_file is None:
-        # FIXED: Match the actual filename from notebook
-        stats_file = f"norm_stats_{lr_dim}to{stage_dims[-1]}_progressive_residual_unet_(20-40-80-200-400)_trained_single_and_double_LDC_and_one_bfs.txt"
     if model_name_pattern is None:
         # FIXED: Match the actual filename pattern from notebook
         model_name_pattern = "unet_stage_{from_dim}to{to_dim}_progressive_residual_unet_(20-40-80-200-400)_trained_single_and_double_LDC_and_one_bfs.h5"
@@ -2302,13 +2417,9 @@ def run_comparison_with_checkpoints(
     hr_fields = ml_super_resolution_unet(
         coarse_fields=coarse_fields,
         lr_dim=lr_dim, hr_dim=nx,
-        stats_file=stats_file,
         stage_dims=stage_dims,
         model_name_pattern=model_name_pattern,
-        use_aspect_ratio_correction=use_aspect_ratio_correction,
-        lx=lx, ly=ly,
-        use_adaptive_normalization=use_adaptive_normalization,
-        blend_factor=blend_factor
+        lx=lx, ly=ly
     )
     
     # ====================
@@ -2514,7 +2625,7 @@ if __name__ == "__main__":
     Ub = 1.0           # Bulk velocity
     
     # Time step (reduced for stability at fine mesh)
-    dt = 8e-4  # Time step (reduced for stability at fine mesh)
+    dt = 1e-3  # Time step (reduced for stability at fine mesh)
     
     # Numerical scheme ('QUICK' or 'UPWIND')
     # UPWIND is more stable for BFS with flow separation
@@ -2523,52 +2634,38 @@ if __name__ == "__main__":
     # Under-relaxation factors (important for BFS stability)
     # More conservative values to prevent NaN/Inf
     relaxation_factors = {
-        'u': 0.30,
-        'v': 0.30,
-        'p': 0.02
+        'u': 0.20,
+        'v': 0.20,
+        'p': 0.01
     }
     
     # Maximum iterations for different simulations
     max_iterations_coarse = 200000   # Max iterations for coarse mesh (10x10)
-    max_iterations_fine_ml = 33000    # Max iterations for fine mesh with ML initialization
+    max_iterations_fine_ml = 300  # Max iterations for fine mesh with ML initialization
     max_iterations_normal = 125000   # Max iterations for normal simulation
     
     # Iteration interval for monitoring and saving plots
-    monitoring_interval = 1000
+    monitoring_interval = 100
 
     # Model name pattern (used to format filenames for each stage)
     # FIXED: Match the actual suffix from the notebook
-    model_suffix = "progressive_residual_unet_(20-40-80-200-400)_trained_with_LDCs-and-one-bfs-with_aspect_ratio_correction"
+    model_suffix = "progressive_residual_unet_(20-40-80-200-400)_trained with bfs Re 300"
     model_name_pattern = f"unet_stage_{{from_dim}}to{{to_dim}}_{model_suffix}.h5"
-    stats_file = f"norm_stats_{lr_dim}to{stage_dims[-1]}_{model_suffix}.txt"
+    
     
     # =========================================================================
-    # ASPECT RATIO CORRECTION FLAG
+    # COARSE SIMULATION OPTIONS (TIME SAVING)
     # =========================================================================
-    
-    # Set to True if the ML model was trained WITH aspect ratio correction enabled
-    # This allows the model to generalize to different geometries (e.g., BFS, LDC)
-    # 
-    # True:  Resample rectangular→square before ML, then square→rectangular after ML
-    #        (Use this when model was trained with aspect ratio correction)
-    # False: Use raw data directly (faster, but requires exact aspect ratio match)
-    # 
-    # CHANGED: Set to True since model is now trained WITH aspect ratio correction
-    use_aspect_ratio_correction = True
-    
-    # =========================================================================
-    # ADDITIONAL ML IMPROVEMENTS
-    # =========================================================================
-    
-    # Adaptive normalization: Blend training stats with input data statistics
-    # Helps model adapt when BFS flow patterns differ significantly from lid-driven cavity
-    # blend_factor controls the blending weight:
-    #   0.0 = Use only training stats (no adaptation, default for U-Net)
-    #   0.3 = 30% input data, 70% training stats (balanced)
-    #   0.5 = 50/50 blend (more aggressive adaptation)
-    #   1.0 = Use only input data stats (full adaptation, may be unstable)
-    blend_factor = 0.0  # U-Net typically works well without adaptation
-    
+
+    # Options:
+    #   'run'  : Run coarse simulation
+    #   'load' : Load from a previously saved coarse simulation HDF5 file
+
+    coarse_simulation_mode = 'load'  # Change to 'run' or 'load' as needed
+
+    # If mode='load', specify the path to the previously saved coarse HDF5 file:
+    # Example: "outputs/17-02-2026-01-39-30/bfs_coarse_Re400_10x10_200000_coarse_iterations_coarse.h5"
+    previous_coarse_hdf5 = "C:\\Users\\amirm\\Downloads\\ddd\\Re 300\\bfs_coarse_Re400_10x10_130000_coarse_iterations.h5"
     # =========================================================================
     # NORMAL SIMULATION OPTIONS (TIME SAVING)
     # =========================================================================
@@ -2584,7 +2681,7 @@ if __name__ == "__main__":
     
     # If mode='load', specify the path to the previously saved HDF5 file:
     # Example: "outputs/17-02-2026-01-39-30/bfs_Re400_400x400_125000_NORMAL_normal.h5"
-    previous_normal_hdf5 = "outputs/17-02-2026-01-39-30/bfs_Re400_400x400_125000_NORMAL_normal.h5"
+    previous_normal_hdf5 = "C:\\Users\\amirm\\Downloads\\ddd\\Re 300\\bfs_Re400_400x400_125000_NORMAL_normal.h5"
     
     # =========================================================================
 
@@ -2597,11 +2694,11 @@ if __name__ == "__main__":
     print(f"Coarse Mesh: {lr_dim}×{lr_dim}")
     print(f"Progressive Stages: {lr_dim} → {' → '.join(map(str, stage_dims))}")
     print(f"BFS Geometry: Lx={lx}, Ly={ly} (aspect ratio: {lx/ly:.2f}:1)")
-    print(f"Aspect Ratio Correction: {'ENABLED ✓' if use_aspect_ratio_correction else 'DISABLED'}")
-    print(f"Adaptive Normalization Blend Factor: {blend_factor:.2f} ({blend_factor*100:.0f}% input data, {(1-blend_factor)*100:.0f}% training data)")
-    if not use_aspect_ratio_correction and lx != ly:
-        print(f"  ⚠️  Note: Testing rectangular geometry with model trained on square")
-        print(f"     If results are poor, try enabling aspect ratio correction")
+    print(f"Per-Sample Normalization: ENABLED")
+    print(f"Coordinate Channels: ENABLED (5-channel input)")
+    print(f"Coarse Simulation Mode: {coarse_simulation_mode.upper()}")
+    if coarse_simulation_mode == 'load':
+        print(f"  Loading from: {previous_coarse_hdf5}")
     print(f"Normal Simulation Mode: {normal_simulation_mode.upper()}")
     if normal_simulation_mode == 'load':
         print(f"  Loading from: {previous_normal_hdf5}")
@@ -2610,29 +2707,57 @@ if __name__ == "__main__":
     print(f"{'='*70}\n")
     
     # =========================================================================
-    # PRE-FLIGHT CHECK: ML MODELS
+    # PRE-FLIGHT CHECK: ALL REQUIRED FILES
     # =========================================================================
 
-    print("\nChecking required ML model files...")
-    print(f"  Stats file: {stats_file}")
-    if not os.path.exists(stats_file):
-        print(f"  ✗ Stats file NOT FOUND")
-        print("  ❌ FATAL: Stats file missing. Aborting simulation.")
-        sys.exit(1)
-    else:
-        print(f"  ✓ Stats file found")
-    
-    # Check stage models
+    print("\n" + "="*70)
+    print("PRE-FLIGHT CHECK")
+    print("="*70)
+
+    _missing = []
+
+    # --- ML stage model files ---
+    print("\n  [ML Models]")
     _prev_dim = lr_dim
     for _target_dim in stage_dims:
         _model_file = model_name_pattern.format(from_dim=_prev_dim, to_dim=_target_dim)
         if os.path.exists(_model_file):
             print(f"  ✓ Stage {_prev_dim}→{_target_dim}: {_model_file}")
         else:
-            print(f"  ✗ Stage {_prev_dim}→{_target_dim}: {_model_file} NOT FOUND")
-            print("  ❌ FATAL: Stage model file missing. Aborting simulation.")
-            sys.exit(1)
+            print(f"  ✗ Stage {_prev_dim}→{_target_dim}: {_model_file}  ← NOT FOUND")
+            _missing.append(_model_file)
         _prev_dim = _target_dim
+
+    # --- Coarse simulation HDF5 (only when load mode) ---
+    if coarse_simulation_mode == 'load':
+        print("\n  [Coarse Simulation - Load File]")
+        if os.path.exists(previous_coarse_hdf5):
+            print(f"  ✓ Coarse HDF5: {previous_coarse_hdf5}")
+        else:
+            print(f"  ✗ Coarse HDF5: {previous_coarse_hdf5}  ← NOT FOUND")
+            _missing.append(previous_coarse_hdf5)
+
+    # --- Normal simulation HDF5 (only when load mode) ---
+    if normal_simulation_mode == 'load':
+        print("\n  [Normal Simulation - Load File]")
+        if os.path.exists(previous_normal_hdf5):
+            print(f"  ✓ Normal HDF5: {previous_normal_hdf5}")
+        else:
+            print(f"  ✗ Normal HDF5: {previous_normal_hdf5}  ← NOT FOUND")
+            _missing.append(previous_normal_hdf5)
+
+    # --- Result ---
+    print()
+    if _missing:
+        print("❌ PRE-FLIGHT FAILED — the following required files are missing:")
+        for _f in _missing:
+            print(f"     • {_f}")
+        print("\nAborting. Fix the paths or missing files before re-running.")
+        print("="*70)
+        sys.exit(1)
+    else:
+        print("✓ All required files found — proceeding with simulation.")
+        print("="*70)
 
     
     # =========================================================================
@@ -2735,25 +2860,67 @@ if __name__ == "__main__":
     # =========================================================================
     
     print("\n" + "#"*70)
-    print("# PART 2A: GENERATE COARSE MESH BFS SOLUTION")
+    print("# PART 2A: COARSE MESH BFS SOLUTION")
     print("#"*70)
-    
-    coarse_fields, iterations_coarse, elapsed_time_coarse, output_dir = generate_coarse_mesh_solution(
-        Re=Re,
-        lr_dim=lr_dim,
-        dt=dt,
-        scheme=scheme,
-        convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
-        max_iterations_coarse=max_iterations_coarse,
-        output_dir=output_dir,
-        bc=bc,
-        step_height=step_height,
-        h=h,
-        Ub=Ub,
-        lx=lx,
-        ly=ly,
-        relaxation_factors=relaxation_factors
-    )
+
+    iterations_coarse = None
+    elapsed_time_coarse = None
+
+    if coarse_simulation_mode == 'run':
+        coarse_fields, iterations_coarse, elapsed_time_coarse, output_dir = generate_coarse_mesh_solution(
+            Re=Re,
+            lr_dim=lr_dim,
+            dt=dt,
+            scheme=scheme,
+            convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
+            max_iterations_coarse=max_iterations_coarse,
+            output_dir=output_dir,
+            bc=bc,
+            step_height=step_height,
+            h=h,
+            Ub=Ub,
+            lx=lx,
+            ly=ly,
+            relaxation_factors=relaxation_factors
+        )
+    else:  # load
+        print("# LOADING PREVIOUS COARSE BFS SIMULATION")
+        try:
+            coarse_solver = load_solver_from_hdf5(
+                filepath=previous_coarse_hdf5,
+                Re=Re, nx=lr_dim, ny=lr_dim, dt=dt, scheme=scheme,
+                lx=lx, ly=ly, bc=bc,
+                step_height=step_height, h=h, Ub=Ub,
+                relaxation_factors=relaxation_factors
+            )
+            coarse_fields = {
+                'u': coarse_solver.Var[0, 1:-1, 1:-1].T.copy(),
+                'v': coarse_solver.Var[1, 1:-1, 1:-1].T.copy(),
+                'p': coarse_solver.Var[2, 1:-1, 1:-1].T.copy(),
+            }
+            iterations_coarse = max_iterations_coarse  # assumed from config
+            elapsed_time_coarse = None
+            print("✓ Coarse simulation loaded successfully")
+            print("⚠️  Note: Coarse time not available from saved file")
+        except Exception as e:
+            print(f"❌ Failed to load coarse simulation: {e}")
+            print("   Falling back to running coarse simulation...")
+            coarse_fields, iterations_coarse, elapsed_time_coarse, output_dir = generate_coarse_mesh_solution(
+                Re=Re,
+                lr_dim=lr_dim,
+                dt=dt,
+                scheme=scheme,
+                convergence_criteria={'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6},
+                max_iterations_coarse=max_iterations_coarse,
+                output_dir=output_dir,
+                bc=bc,
+                step_height=step_height,
+                h=h,
+                Ub=Ub,
+                lx=lx,
+                ly=ly,
+                relaxation_factors=relaxation_factors
+            )
     
     # =========================================================================
     # PART 2B: RUN ML-ACCELERATED FINE SIMULATION (PROGRESSIVE U-NET)
@@ -2776,7 +2943,6 @@ if __name__ == "__main__":
         max_iterations_fine=max_iterations_fine_ml,
         output_name=os.path.join(output_dir, 
                                 f"bfs_Re{Re}_{nx}x{ny}_{max_iterations_coarse}_coarse_{max_iterations_fine_ml}_fine_UNET"),
-        stats_file=stats_file,
         stage_dims=stage_dims,
         model_name_pattern=model_name_pattern,
         bc=bc,
@@ -2786,9 +2952,6 @@ if __name__ == "__main__":
         lx=lx,
         ly=ly,
         relaxation_factors=relaxation_factors,
-        use_aspect_ratio_correction=use_aspect_ratio_correction,
-        use_adaptive_normalization=blend_factor > 0,
-        blend_factor=blend_factor,
         normal_solver=solver_normal,  # Pass normal solver for monitoring
         check_interval=monitoring_interval            # Check every monitoring_interval iterations
     )
@@ -2841,11 +3004,17 @@ if __name__ == "__main__":
     print(f"BFS Geometry: Lx={lx}, Ly={ly}, Step Height={step_height}, h={h}")
     
     # Calculate total ML-accelerated time (coarse + fine)
-    total_ml_time = elapsed_time_coarse + elapsed_time_ml
-    
+    if elapsed_time_coarse is not None:
+        total_ml_time = elapsed_time_coarse + elapsed_time_ml
+    else:
+        total_ml_time = elapsed_time_ml  # coarse time not available (loaded)
+
     print(f"\nML-Accelerated Simulation (Progressive U-Net):")
     print(f"  Coarse mesh iterations ({lr_dim}x{lr_dim}): {iterations_coarse}")
-    print(f"  Coarse mesh time: {elapsed_time_coarse:.2f} seconds")
+    if elapsed_time_coarse is not None:
+        print(f"  Coarse mesh time: {elapsed_time_coarse:.2f} seconds")
+    else:
+        print(f"  Coarse mesh time: Not available (loaded from file)")
     print(f"  Fine mesh iterations ({nx}x{ny}): {iterations_ml}")
     print(f"  Fine mesh time: {elapsed_time_ml:.2f} seconds")
     print(f"  Total ML time (coarse + fine): {total_ml_time:.2f} seconds")
@@ -2884,18 +3053,17 @@ if __name__ == "__main__":
             "Normal Simulation Mode": normal_simulation_mode
         },
         "ML Acceleration Settings (Progressive U-Net)": {
-            "Stats File": stats_file,
             "Model Pattern": model_name_pattern,
             "Stages": f"{lr_dim} -> {' -> '.join(map(str, stage_dims))}",
-            "Aspect Ratio Correction": str(use_aspect_ratio_correction),
-            "Adaptive Normalization": f"{blend_factor > 0} (Blend: {blend_factor})", 
+            "Normalization": "Per-sample Z-score",
+            "Input Channels": "5 (u, v, p, x̄, ȳ)",
         },
         "Results": {
             "Coarse Iterations": str(iterations_coarse),
-            "Coarse Time (s)": f"{elapsed_time_coarse:.2f}",
+            "Coarse Time (s)": f"{elapsed_time_coarse:.2f}" if elapsed_time_coarse is not None else "Not available (loaded)",
             "ML+Fine Iterations": str(iterations_ml),
             "ML+Fine Time (s)": f"{elapsed_time_ml:.2f}",
-            "Total ML Time (s)": f"{elapsed_time_coarse + elapsed_time_ml:.2f}",
+            "Total ML Time (s)": f"{total_ml_time:.2f}",
             "Output Directory": output_dir
         }
     }
@@ -2905,7 +3073,6 @@ if __name__ == "__main__":
         summary_info["Results"]["Normal Iterations"] = str(iterations_normal)
         summary_info["Results"]["Normal Mode"] = normal_simulation_mode
         if elapsed_time_normal is not None and elapsed_time_normal > 0:
-            total_ml_time = elapsed_time_coarse + elapsed_time_ml
             summary_info["Results"]["Normal Time (s)"] = f"{elapsed_time_normal:.2f}"
             summary_info["Results"]["Speedup Factor"] = f"{elapsed_time_normal/total_ml_time:.2f}x"
         else:
