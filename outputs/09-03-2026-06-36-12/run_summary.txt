@@ -1,0 +1,38 @@
+======================================================================
+BFS SIMULATION RUN SUMMARY
+Date: 2026-03-09 08:31:12
+======================================================================
+
+CONFIGURATION
+-------------
+Reynolds Number               : 100
+Resolution (Fine)             : 400x400
+Resolution (Coarse)           : 10x10
+Domain Size                   : 20.0 x 1.94
+Step Height                   : 0.94
+Channel Height (h)            : 1.0
+Diff. Scheme                  : UPWIND
+Time Step                     : 0.001
+Normal Simulation Mode        : load
+
+ML ACCELERATION SETTINGS (PROGRESSIVE U-NET)
+--------------------------------------------
+Model Pattern                 : unet_stage_{from_dim}to{to_dim}_progressive_residual_unet_(20-40-80-200-400)_trained with bfs Re 300.h5
+Stages                        : 10 -> 20 -> 40 -> 80 -> 200 -> 400
+Normalization                 : Per-sample Z-score
+Input Channels                : 5 (u, v, p, x̄, ȳ)
+
+RESULTS
+-------
+Coarse Iterations             : 200000
+Coarse Time (s)               : Not available (loaded)
+ML+Fine Iterations            : 35000
+ML+Fine Time (s)              : 6891.09
+Total ML Time (s)             : 6891.09
+Output Directory              : outputs\09-03-2026-06-36-12
+Normal Iterations             : 125000
+Normal Mode                   : load
+Normal Time (s)               : Not available (loaded from file)
+Speedup Factor                : Cannot calculate (time not available)
+Iterations Saved (Fine only)  : 90000
+

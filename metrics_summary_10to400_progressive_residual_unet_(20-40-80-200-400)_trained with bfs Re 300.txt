@@ -1,0 +1,40 @@
+# Progressive Cascaded Super-Resolution Metrics
+# Normalization: per-sample Z-score (no global stats file needed)
+# Stage-wise performance
+
+Stage: 10to20
+  MAE (u): 0.014273
+  MAE (v): 0.002913
+  MAE (p): 0.002121
+  MAE (avg): 0.006436
+
+Stage: 20to40
+  MAE (u): 0.015312
+  MAE (v): 0.003950
+  MAE (p): 0.003100
+  MAE (avg): 0.007454
+
+Stage: 40to80
+  MAE (u): 0.017342
+  MAE (v): 0.003982
+  MAE (p): 0.003563
+  MAE (avg): 0.008296
+
+Stage: 80to200
+  MAE (u): 0.028660
+  MAE (v): 0.007403
+  MAE (p): 0.007017
+  MAE (avg): 0.014360
+
+Stage: 200to400
+  MAE (u): 0.031097
+  MAE (v): 0.008575
+  MAE (p): 0.012656
+  MAE (avg): 0.017443
+
+
+Final Pipeline Performance (10 to 400x400):
+  MAE (u): 0.031097
+  MAE (v): 0.008575
+  MAE (p): 0.012656
+  MAE (avg): 0.017443
