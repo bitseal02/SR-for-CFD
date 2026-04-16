@@ -2641,8 +2641,7 @@ if __name__ == "__main__":
     
     # Maximum iterations for different simulations
     max_iterations_coarse = 200000   # Max iterations for coarse mesh (10x10)
-    max_iterations_fine_ml = 35000jhfhadsjkfdskjhdsfdskjsds
-    1
+    max_iterations_fine_ml = 35000
 
       # Max iterations for fine mesh with ML initialization
     max_iterations_normal = 125000   # Max iterations for normal simulation
