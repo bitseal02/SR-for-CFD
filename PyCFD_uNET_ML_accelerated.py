@@ -1723,7 +1723,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Configuration
     # -------------------------------------------------------------------------
-    Re = 900
+    Re = 800
     nx = 400
     ny = 400
     lr_dim = 10
@@ -1736,19 +1736,19 @@ if __name__ == "__main__":
     convergence_criteria = {'u': 1e-6, 'v': 1e-6, 'p': 1e-6, 'continuity': 1e-6}
 
     max_iterations_coarse = 150000
-    max_iterations_fine_ml = 30000
+    max_iterations_fine_ml = 500
     max_iterations_normal = 100000
-    monitoring_interval = 500
+    monitoring_interval = 100
 
-    model_suffix = "progressive_residual_unet_(20-40-80-200-400)_trained along with bfs 100,300"
+    model_suffix = "burgers2d_finetune"
+    #model_suffix = "progressive_residual_unet_(20-40-80-200-400)_trained along with bfs 100,300"
 
     model_name_pattern = f"unet_stage_{{from_dim}}to{{to_dim}}_{model_suffix}.h5"
 
-    coarse_simulation_mode = 'skip'   # 'run' or 'load'
-    normal_simulation_mode = 'skip'  # 'run', 'load', or 'skip'
-    previous_coarse_hdf5 = r"C:\Users\NAVANEETH\Downloads\vvvvvv\outputs\13-04-2026-17-21-27\coarse_Re900_10x10_150000_coarse_iterations.h5"
-    previous_normal_hdf5 = r"C:\Users\NAVANEETH\Downloads\vvvvvv\outputs\13-04-2026-17-21-27\cavity_Re900_400x400_100000_NORMAL_normal.h5"
-
+    coarse_simulation_mode = 'load'   # 'run' or 'load'
+    normal_simulation_mode = 'load'  # 'run', 'load', or 'skip'
+    previous_coarse_hdf5 = r"C:\Users\amirm\Downloads\FYP\SR-for-CFD\outputs\10-05-2026-23-54-12 (LDC before finetuning)\coarse_Re800_10x10_150000_coarse_iterations.h5"
+    previous_normal_hdf5 = r"C:\Users\amirm\Downloads\FYP\SR-for-CFD\outputs\10-05-2026-23-54-12 (LDC before finetuning)\cavity_Re800_400x400_100000_NORMAL_normal.h5"
     # Default cavity BCs
     bc = BoundaryConditions()
     bc.u_boundaries['left'] = BoundaryCondition('dirichlet', 0.0)

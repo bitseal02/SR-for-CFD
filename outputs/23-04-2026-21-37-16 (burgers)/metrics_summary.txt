@@ -1,0 +1,8 @@
+BURGERS 1D COMPARISON METRICS
+============================================================
+ml_vs_ref_l2: 1.56606127e-01
+ml_vs_ref_mae: 1.08965977e-01
+ml_vs_ref_max_abs: 5.20871591e-01
+ml_refined_vs_ref_l2: 1.70232399e-02
+ml_refined_vs_ref_mae: 1.06708480e-02
+ml_refined_vs_ref_max_abs: 1.27007304e-01

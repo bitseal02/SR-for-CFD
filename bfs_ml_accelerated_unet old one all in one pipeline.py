@@ -2605,7 +2605,7 @@ if __name__ == "__main__":
     # =========================================================================
     
     # Reynolds number
-    Re = 100
+    Re = 400
     
     # Fine mesh dimensions
     nx = 400
@@ -2641,7 +2641,7 @@ if __name__ == "__main__":
     
     # Maximum iterations for different simulations
     max_iterations_coarse = 200000   # Max iterations for coarse mesh (10x10)
-    max_iterations_fine_ml = 35000
+    max_iterations_fine_ml = 500
 
       # Max iterations for fine mesh with ML initialization
     max_iterations_normal = 125000   # Max iterations for normal simulation
@@ -2651,9 +2651,9 @@ if __name__ == "__main__":
 
     # Model name pattern (used to format filenames for each stage)
     # FIXED: Match the actual suffix from the notebook
-    model_suffix = "progressive_residual_unet_(20-40-80-200-400)_trained with bfs Re 300"
+    model_suffix = "progressive_residual_unet_(20-40-80-200-400)_trained along with bfs 100,300"
+    #model_suffix = "burgers2d_finetune"
     model_name_pattern = f"unet_stage_{{from_dim}}to{{to_dim}}_{model_suffix}.h5"
-    
     # =========================================================================
     # COARSE SIMULATION OPTIONS (TIME SAVING)
     # =========================================================================
@@ -2666,7 +2666,7 @@ if __name__ == "__main__":
 
     # If mode='load', specify the path to the previously saved coarse HDF5 file:
     # Example: "outputs/17-02-2026-01-39-30/bfs_coarse_Re400_10x10_200000_coarse_iterations_coarse.h5"
-    previous_coarse_hdf5 = "C:\\Users\\NAVANEETH\\Downloads\\ddd\\ddd\\Re 300\\bfs_Re100_mesh10x10.h5"
+    previous_coarse_hdf5 = r"C:\Users\amirm\Downloads\FYP\SR-for-CFD\bfs_coarse_Re400_10x10_130000_coarse_iterations.h5"
 
     # =========================================================================
     # NORMAL SIMULATION OPTIONS (TIME SAVING)
@@ -2683,7 +2683,7 @@ if __name__ == "__main__":
     
     # If mode='load', specify the path to the previously saved HDF5 file:
     # Example: "outputs/17-02-2026-01-39-30/bfs_Re400_400x400_125000_NORMAL_normal.h5"
-    previous_normal_hdf5 = "C:\\Users\\NAVANEETH\\Downloads\\ddd\\ddd\\Re 300\\bfs_Re100_mesh400x400.h5"
+    previous_normal_hdf5 = r"C:\Users\amirm\Downloads\FYP\SR-for-CFD\bfs_Re400_400x400_125000_NORMAL_normal.h5"
     
     # =========================================================================
 

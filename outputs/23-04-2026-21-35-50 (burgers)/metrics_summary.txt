@@ -1,0 +1,8 @@
+BURGERS 1D COMPARISON METRICS
+============================================================
+ml_vs_ref_l2: nan
+ml_vs_ref_mae: nan
+ml_vs_ref_max_abs: nan
+ml_refined_vs_ref_l2: nan
+ml_refined_vs_ref_mae: nan
+ml_refined_vs_ref_max_abs: nan
