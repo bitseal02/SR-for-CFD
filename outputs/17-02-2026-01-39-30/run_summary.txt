@@ -1,0 +1,35 @@
+======================================================================
+BFS SIMULATION RUN SUMMARY
+Date: 2026-02-17 14:03:43
+======================================================================
+
+CONFIGURATION
+-------------
+Reynolds Number               : 400
+Resolution (Fine)             : 400x400
+Resolution (Coarse)           : 10x10
+Domain Size                   : 20.0 x 1.94
+Step Height                   : 0.94
+Channel Height (h)            : 1.0
+Diff. Scheme                  : UPWIND
+Time Step                     : 0.0008
+
+ML ACCELERATION SETTINGS (PROGRESSIVE U-NET)
+--------------------------------------------
+Stats File                    : norm_stats_10to400_progressive_residual_unet_(20-40-80-200-400)_trained_with_single-double_LDCs_and_one_bfs.txt
+Model Pattern                 : unet_stage_{from_dim}to{to_dim}_progressive_residual_unet_(20-40-80-200-400)_trained_with_single-double_LDCs_and_one_bfs.h5
+Stages                        : 10 -> 20 -> 40 -> 80 -> 200 -> 400
+Aspect Ratio Correction       : False
+Adaptive Normalization        : False (Blend: 0.0)
+
+RESULTS
+-------
+Normal Iterations             : 125000
+Normal Time (s)               : 21198.98
+Coarse Iterations             : 150000
+ML+Fine Iterations            : 125000
+ML+Fine Time (s)              : 23025.83
+Speedup Factor                : 0.92x
+Iterations Saved              : 0
+Output Directory              : outputs\17-02-2026-01-39-30
+
